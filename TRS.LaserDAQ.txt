@@ -1,0 +1,480 @@
+[[[DefaultLaser]]]
+[[S10453-1024Q]]
+[1000]
+{1}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 1188
+DAQ:Pulse2:Low_Ticks         = 1188
+DAQ:Pulse1:Initial_Delay(ms) = 1188
+DAQ:Pulse2:Initial_Delay(ms) = 1188
+DAQ:Pulse1:High_Ticks        = 2
+DAQ:Pulse2:High_Ticks        = 251
+
+[2000]
+{1}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Timebase:Frequency(Hz)= 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 594
+DAQ:Pulse2:Low_Ticks         = 594
+DAQ:Pulse1:Initial_Delay(ms) = 594
+DAQ:Pulse2:Initial_Delay(ms) = 594
+DAQ:Pulse1:High_Ticks        = 2
+DAQ:Pulse2:High_Ticks        = 126
+
+{2}
+Common:Trigger_Frequency(Hz)= 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Timebase:Frequency(Hz)= 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 594
+DAQ:Pulse2:Low_Ticks         = 594
+DAQ:Pulse1:Initial_Delay(ms) = 594
+DAQ:Pulse2:Initial_Delay(ms) = 594
+DAQ:Pulse1:High_Ticks        = 1252
+DAQ:Pulse2:High_Ticks        = 1376
+
+[4000]
+{1}
+Common:Trigger_Frequency(Hz)= 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Timebase:Frequency(Hz)= 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 594
+DAQ:Pulse2:Low_Ticks         = 594
+DAQ:Pulse1:Initial_Delay(ms) = 594
+DAQ:Pulse2:Initial_Delay(ms) = 594
+DAQ:Pulse1:High_Ticks        = 2
+DAQ:Pulse2:High_Ticks        = 126
+
+{2}
+Common:Trigger_Frequency(Hz)= 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Timebase:Frequency(Hz)= 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 297
+DAQ:Pulse2:Low_Ticks         = 297
+DAQ:Pulse1:Initial_Delay(ms) = 297
+DAQ:Pulse2:Initial_Delay(ms) = 297
+DAQ:Pulse1:High_Ticks        = 628
+DAQ:Pulse2:High_Ticks        = 689
+
+{4}
+Common:Trigger_Frequency(Hz)= 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Timebase:Frequency(Hz)= 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 297
+DAQ:Pulse2:Low_Ticks         = 297
+DAQ:Pulse1:Initial_Delay(ms) = 297
+DAQ:Pulse2:Initial_Delay(ms) = 297
+DAQ:Pulse1:High_Ticks        = 1878
+DAQ:Pulse2:High_Ticks        = 1939
+
+[5000]
+{1}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 523
+DAQ:Pulse2:Low_Ticks         = 523
+DAQ:Pulse1:Initial_Delay(ms) = 523
+DAQ:Pulse2:Initial_Delay(ms) = 523
+DAQ:Pulse1:High_Ticks        = 2
+DAQ:Pulse2:High_Ticks        = 111
+
+{2}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 285
+DAQ:Pulse2:Low_Ticks         = 285
+DAQ:Pulse1:Initial_Delay(ms) = 285
+DAQ:Pulse2:Initial_Delay(ms) = 285
+DAQ:Pulse1:High_Ticks        = 602
+DAQ:Pulse2:High_Ticks        = 662
+
+{5}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 238
+DAQ:Pulse2:Low_Ticks         = 238
+DAQ:Pulse1:Initial_Delay(ms) = 238
+DAQ:Pulse2:Initial_Delay(ms) = 238
+DAQ:Pulse1:High_Ticks        = 2002
+DAQ:Pulse2:High_Ticks        = 1551
+
+[8000]
+{2}
+Common:Trigger_Frequency(Hz) = 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 297
+DAQ:Pulse2:Low_Ticks         = 297
+DAQ:Pulse1:Initial_Delay(ms) = 297
+DAQ:Pulse2:Initial_Delay(ms) = 297
+DAQ:Pulse1:High_Ticks        = 628
+DAQ:Pulse2:High_Ticks        = 689
+
+{4}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 297
+DAQ:Pulse2:Low_Ticks         = 297
+DAQ:Pulse1:Initial_Delay(ms) = 297
+DAQ:Pulse2:Initial_Delay(ms) = 297
+DAQ:Pulse1:High_Ticks        = 1878
+DAQ:Pulse2:High_Ticks        = 1939
+
+{8}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 297
+DAQ:Pulse2:Low_Ticks         = 297
+DAQ:Pulse1:Initial_Delay(ms) = 297
+DAQ:Pulse2:Initial_Delay(ms) = 297
+DAQ:Pulse1:High_Ticks        = 4378
+DAQ:Pulse2:High_Ticks        = 3815
+
+[10000]
+{2}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 262
+DAQ:Pulse2:Low_Ticks         = 262
+DAQ:Pulse1:Initial_Delay(ms) = 262
+DAQ:Pulse2:Initial_Delay(ms) = 262
+DAQ:Pulse1:High_Ticks        = 552
+DAQ:Pulse2:High_Ticks        = 605
+
+{4}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 143
+DAQ:Pulse2:Low_Ticks         = 143
+DAQ:Pulse1:Initial_Delay(ms) = 143
+DAQ:Pulse2:Initial_Delay(ms) = 143
+DAQ:Pulse1:High_Ticks        = 902
+DAQ:Pulse2:High_Ticks        = 631
+
+{5}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 119
+DAQ:Pulse2:Low_Ticks         = 119
+DAQ:Pulse1:Initial_Delay(ms) = 119
+DAQ:Pulse2:Initial_Delay(ms) = 119
+DAQ:Pulse1:High_Ticks        = 1002
+DAQ:Pulse2:High_Ticks        = 776
+
+{10}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 119
+DAQ:Pulse2:Low_Ticks         = 119
+DAQ:Pulse1:Initial_Delay(ms) = 119
+DAQ:Pulse2:Initial_Delay(ms) = 119
+DAQ:Pulse1:High_Ticks        = 2252
+DAQ:Pulse2:High_Ticks        = 2026
+
+[20000]
+{4}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 131
+DAQ:Pulse2:Low_Ticks         = 131
+DAQ:Pulse1:Initial_Delay(ms) = 131
+DAQ:Pulse2:Initial_Delay(ms) = 131
+DAQ:Pulse1:High_Ticks        = 828
+DAQ:Pulse2:High_Ticks        = 853
+
+{5}
+Common:Trigger_Frequency(Hz) = 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 4500000
+DAQ:Timebase:Frequency(Hz)   = 4500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 4500000
+DAQ:Pulse1:Low_Ticks         = 107
+DAQ:Pulse2:Low_Ticks         = 107
+DAQ:Pulse1:Initial_Delay(ms) = 107
+DAQ:Pulse2:Initial_Delay(ms) = 107
+DAQ:Pulse1:High_Ticks        = 903
+DAQ:Pulse2:High_Ticks        = 924
+
+{8}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 72
+DAQ:Pulse2:Low_Ticks         = 72
+DAQ:Pulse1:Initial_Delay(ms) = 72
+DAQ:Pulse2:Initial_Delay(ms) = 72
+DAQ:Pulse1:High_Ticks        = 1052
+DAQ:Pulse2:High_Ticks        = 915
+
+{10}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 59
+DAQ:Pulse2:Low_Ticks         = 59
+DAQ:Pulse1:Initial_Delay(ms) = 59
+DAQ:Pulse2:Initial_Delay(ms) = 59
+DAQ:Pulse1:High_Ticks        = 1128
+DAQ:Pulse2:High_Ticks        = 892
+
+{20}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 59
+DAQ:Pulse2:Low_Ticks         = 59
+DAQ:Pulse1:Initial_Delay(ms) = 59
+DAQ:Pulse2:Initial_Delay(ms) = 59
+DAQ:Pulse1:High_Ticks        = 2378
+DAQ:Pulse2:High_Ticks        = 2018
+
+[40000]
+{8}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 65
+DAQ:Pulse2:Low_Ticks         = 65
+DAQ:Pulse1:Initial_Delay(ms) = 65
+DAQ:Pulse2:Initial_Delay(ms) = 65
+DAQ:Pulse1:High_Ticks        = 966
+DAQ:Pulse2:High_Ticks        = 978
+
+{10}
+Common:Trigger_Frequency(Hz) = 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 59
+DAQ:Pulse2:Low_Ticks         = 59
+DAQ:Pulse1:Initial_Delay(ms) = 59
+DAQ:Pulse2:Initial_Delay(ms) = 59
+DAQ:Pulse1:High_Ticks        = 1128
+DAQ:Pulse2:High_Ticks        = 1016
+
+{20}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 30
+DAQ:Pulse2:Low_Ticks         = 30
+DAQ:Pulse1:Initial_Delay(ms) = 30
+DAQ:Pulse2:Initial_Delay(ms) = 30
+DAQ:Pulse1:High_Ticks        = 1190
+DAQ:Pulse2:High_Ticks        = 1009
+
+{40}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 30
+DAQ:Pulse2:Low_Ticks         = 30
+DAQ:Pulse1:Initial_Delay(ms) = 30
+DAQ:Pulse2:Initial_Delay(ms) = 30
+DAQ:Pulse1:High_Ticks        = 2440
+DAQ:Pulse2:High_Ticks        = 2135
+
+[50000]
+{10}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 53
+DAQ:Pulse2:Low_Ticks         = 53
+DAQ:Pulse1:Initial_Delay(ms) = 53
+DAQ:Pulse2:Initial_Delay(ms) = 53
+DAQ:Pulse1:High_Ticks        = 992
+DAQ:Pulse2:High_Ticks        = 891
+
+{20}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 29
+DAQ:Pulse2:Low_Ticks         = 29
+DAQ:Pulse1:Initial_Delay(ms) = 29
+DAQ:Pulse2:Initial_Delay(ms) = 29
+DAQ:Pulse1:High_Ticks        = 1142
+DAQ:Pulse2:High_Ticks        = 1027
+
+{25}
+Common:Trigger_Frequency(Hz)= 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Timebase:Frequency(Hz)= 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks     = 24
+DAQ:Pulse2:Low_Ticks     = 24
+DAQ:Pulse1:Initial_Delay(ms) = 24
+DAQ:Pulse2:Initial_Delay(ms) = 24
+DAQ:Pulse1:High_Ticks    = 1202
+DAQ:Pulse2:High_Ticks    = 1006
+
+{50}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 24
+DAQ:Pulse2:Low_Ticks         = 24
+DAQ:Pulse1:Initial_Delay(ms) = 24
+DAQ:Pulse2:Initial_Delay(ms) = 24
+DAQ:Pulse1:High_Ticks        = 2452
+DAQ:Pulse2:High_Ticks        = 2156
+
+[100000]
+{20}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 26
+DAQ:Pulse2:Low_Ticks         = 26
+DAQ:Pulse1:Initial_Delay(ms) = 26
+DAQ:Pulse2:Initial_Delay(ms) = 26
+DAQ:Pulse1:High_Ticks        = 1048
+DAQ:Pulse2:High_Ticks        = 998
+
+{25}
+Common:Trigger_Frequency(Hz) = 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 24
+DAQ:Pulse2:Low_Ticks         = 24
+DAQ:Pulse1:Initial_Delay(ms) = 24
+DAQ:Pulse2:Initial_Delay(ms) = 24
+DAQ:Pulse1:High_Ticks        = 1202
+DAQ:Pulse2:High_Ticks        = 1106
+
+{40}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 15
+DAQ:Pulse2:Low_Ticks         = 15
+DAQ:Pulse1:Initial_Delay(ms) = 15
+DAQ:Pulse2:Initial_Delay(ms) = 15
+DAQ:Pulse1:High_Ticks        = 1172
+DAQ:Pulse2:High_Ticks        = 1083
+
+{50}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 12
+DAQ:Pulse2:Low_Ticks         = 12
+DAQ:Pulse1:Initial_Delay(ms) = 12
+DAQ:Pulse2:Initial_Delay(ms) = 12
+DAQ:Pulse1:High_Ticks        = 1228
+DAQ:Pulse2:High_Ticks        = 1013
+
+{100}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 12
+DAQ:Pulse2:Low_Ticks         = 12
+DAQ:Pulse1:Initial_Delay(ms) = 12
+DAQ:Pulse2:Initial_Delay(ms) = 12
+DAQ:Pulse1:High_Ticks        = 2478
+DAQ:Pulse2:High_Ticks        = 2119
+
+[200000]
+{40}
+Common:Trigger_Frequency(Hz) = 5000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5500000
+DAQ:Timebase:Frequency(Hz)   = 5500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5500000
+DAQ:Pulse1:Low_Ticks         = 13
+DAQ:Pulse2:Low_Ticks         = 13
+DAQ:Pulse1:Initial_Delay(ms) = 13
+DAQ:Pulse2:Initial_Delay(ms) = 13
+DAQ:Pulse1:High_Ticks        = 1076
+DAQ:Pulse2:High_Ticks        = 1051
+
+{50}
+Common:Trigger_Frequency(Hz) = 4000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 5000000
+DAQ:Timebase:Frequency(Hz)   = 5000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 5000000
+DAQ:Pulse1:Low_Ticks         = 12
+DAQ:Pulse2:Low_Ticks         = 12
+DAQ:Pulse1:Initial_Delay(ms) = 12
+DAQ:Pulse2:Initial_Delay(ms) = 12
+DAQ:Pulse1:High_Ticks        = 1228
+DAQ:Pulse2:High_Ticks        = 1109
+
+{80}
+Common:Trigger_Frequency(Hz) = 2500
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 3000000
+DAQ:Timebase:Frequency(Hz)   = 3000000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 3000000
+DAQ:Pulse1:Low_Ticks         = 7
+DAQ:Pulse2:Low_Ticks         = 7
+DAQ:Pulse1:Initial_Delay(ms) = 7
+DAQ:Pulse2:Initial_Delay(ms) = 7
+DAQ:Pulse1:High_Ticks        = 1188
+DAQ:Pulse2:High_Ticks        = 1090
+
+{100}
+Common:Trigger_Frequency(Hz) = 2000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 6
+DAQ:Pulse2:Low_Ticks         = 6
+DAQ:Pulse1:Initial_Delay(ms) = 6
+DAQ:Pulse2:Initial_Delay(ms) = 6
+DAQ:Pulse1:High_Ticks        = 1240
+DAQ:Pulse2:High_Ticks        = 1024
+
+{200}
+Common:Trigger_Frequency(Hz) = 1000
+DAQ:AI:Maximum_DAQ_Rate(Hz)  = 2500000
+DAQ:Timebase:Frequency(Hz)   = 2500000
+DAQ:AISampleCLock:Maximum_DAQ_Rate(Hz)= 2500000
+DAQ:Pulse1:Low_Ticks         = 6
+DAQ:Pulse2:Low_Ticks         = 6
+DAQ:Pulse1:Initial_Delay(ms) = 6
+DAQ:Pulse2:Initial_Delay(ms) = 6
+DAQ:Pulse1:High_Ticks        = 2490
+DAQ:Pulse2:High_Ticks        = 2058

@@ -1,3 +1,5 @@
 numpy
 matplotlib
 nidaqmx
+pythonnet
+pyvisa

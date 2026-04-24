@@ -1,0 +1,141 @@
+<Common>
+  Trigger_Frequency(Hz)    = 1000
+  First_Scan_Blocked(T/F)  = T
+  CCD_Pixels                = 1024
+</Common>
+
+<DAQ>
+  <Timebase>
+    Counter=/TAS_CounterBoard/ctr0
+    Frequency(Hz)=2500000
+    DAQ_Output_Terminal=/TAS_DAQBoard/PFI4
+  </Timebase>
+
+  <Pulse1>
+    Counter=/TAS_CounterBoard/ctr1
+    Source_Of_Ticks=/TAS_CounterBoard/Ctr0InternalOutput
+    Trigger_Source=/TAS_DAQBoard/PFI9
+    Trigger_Minimum_Pulse_Width(s)=0.000002
+    High_Ticks=50
+    Low_Ticks=1250
+    Initial_Delay(ms)=1250
+    Output_Terminal=Default
+  </Pulse1>
+
+  <Pulse2>
+    Counter=/TAS_CounterBoard/ctr2
+    Source_Of_Ticks=/TAS_CounterBoard/Ctr0InternalOutput
+    Trigger_Source=/TAS_CounterBoard/Ctr1InternalOutput
+    Trigger_Minimum_Pulse_Width(s)=0.000002
+    High_Ticks=125
+    Low_Ticks=1185
+    Initial_Delay(ms)=1185
+    Output_Terminal=/TAS_DAQBoard/PFI8
+  </Pulse2>
+
+  <ChopperPulse>
+    Counter=/TAS_CounterBoard/ctr3
+    Source=/TAS_CounterBoard/Ctr2InternalOutput
+    Output_Event_Terminal=/TAS_DAQBoard/PFI3
+    Source_Edge=10171
+  </ChopperPulse>
+
+  <AISampleClock>
+    Counter=/TAS_CounterBoard/ctr4
+    Maximum_DAQ_Rate(Hz)=2500000
+    Trigger_Source=/TAS_CounterBoard/Ctr2InternalOutput
+    Trigger_Minimum_Pulse_Width(s)=1
+    Trigger_Edge=10171
+    Samples_Per_Trigger=1050
+    DAQ_Output_Terminal=
+    Initial_Delay(s)   = 0.001
+  </AISampleClock>
+
+  <AI>
+    Physical_Channel=/TAS_DAQBoard/ai0:2
+    Minimum_Value(V)=0.4
+    Maximum_Value(V)=4.5
+    Start-Trigger_Source=/TAS_CounterBoard/Ctr3InternalOutput
+    Start-Trigger_Minimum_Pulse_Width(s)=1
+    Start-Trigger_Edge=10171
+    Sample-Clock_Source=/TAS_CounterBoard/Ctr4InternalOutput
+    Maximum_DAQ_Rate(Hz)=2500000
+    Ignored_Sample_Count=16
+  </AI>
+
+  <LaserEmulation>
+    Enabled(T/F)=F
+    Counter=/TAS_CounterBoard/ctr7
+    Frequency(Hz)=1000
+    DAQ_Output_Terminal=
+  </LaserEmulation>
+
+</DAQ>
+
+<DAQem>
+  <Timebase>
+    Counter=/TAS_CounterBoard/ctr0
+    Frequency(Hz)=2500000
+    DAQ_Output_Terminal=/TAS_DAQBoard/PFI4
+  </Timebase>
+
+  <Pulse1>
+    Counter=/TAS_CounterBoard/ctr1
+    Source_Of_Ticks=/TAS_CounterBoard/Ctr0InternalOutput
+    Trigger_Source=/TAS_CounterBoard/Ctr7InternalOutput
+    Trigger_Minimum_Pulse_Width(s)=0.000002
+    High_Ticks=50
+    Low_Ticks=1250
+    Initial_Delay(ms)=1250
+    Output_Terminal=Default
+  </Pulse1>
+
+  <Pulse2>
+    Counter=/TAS_CounterBoard/ctr2
+    Source_Of_Ticks=/TAS_CounterBoard/Ctr0InternalOutput
+    Trigger_Source=/TAS_CounterBoard/Ctr1InternalOutput
+    Trigger_Minimum_Pulse_Width(s)=0.000002
+    High_Ticks=70
+    Low_Ticks=1185
+    Initial_Delay(ms)=1185
+    Output_Terminal=/TAS_DAQBoard/PFI8
+  </Pulse2>
+
+  <ChopperPulse>
+    Counter=/TAS_CounterBoard/ctr3
+    Source=/TAS_CounterBoard/Ctr2InternalOutput
+    Output_Event_Terminal=/TAS_DAQBoard/PFI3
+    Source_Edge=10171
+  </ChopperPulse>
+
+  <AISampleClock>
+    Counter=/TAS_CounterBoard/ctr4
+    Maximum_DAQ_Rate(Hz)=2500000
+    Trigger_Source=/TAS_CounterBoard/Ctr2InternalOutput
+    Trigger_Minimum_Pulse_Width(s)=1
+    Trigger_Edge=10171
+    Samples_Per_Trigger=1050
+    DAQ_Output_Terminal=
+    Initial_Delay(s)   = 0.001
+  </AISampleClock>
+
+  <AI>
+    Physical_Channel=/TAS_DAQBoard/ai0:2
+    Minimum_Value(V)=0.4
+    Maximum_Value(V)=4.5
+    Start-Trigger_Source=/TAS_CounterBoard/Ctr3InternalOutput
+    Start-Trigger_Minimum_Pulse_Width(s)=1
+    Start-Trigger_Edge=10171
+    Sample-Clock_Source=/TAS_CounterBoard/Ctr4InternalOutput
+    Maximum_DAQ_Rate(Hz)=2500000
+    Ignored_Sample_Count=16
+  </AI>
+
+  <LaserEmulation>
+    Enabled(T/F)=T
+    Counter=/TAS_CounterBoard/ctr7
+    Frequency(Hz)=1000
+    DAQ_Output_Terminal=
+  </LaserEmulation>
+
+</DAQem>

@@ -25,6 +25,9 @@ Thumbs.db
 # Data/output artifacts
 optimization_results/
 lucky_captures/
+acquisition_results/
 *.csv
 *.json
 *.log
+*.tdms
+*.tdms_index
