@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import time
 import argparse
 import threading
+import csv
+import json
 from pathlib import Path
 from contextlib import nullcontext
 from collections import deque
@@ -15,6 +17,7 @@ from nidaqmx.constants import (
     LoggingMode,
     LoggingOperation,
     OverwriteMode,
+    ReadRelativeTo,
 )
 
 
@@ -109,6 +112,19 @@ class PDAControllerDAQSimple:
         "clk_initial_delay": 0.0,
     }
 
+    GUARD_10US_TIMING = {
+        "description": (
+            "Near-1 kHz guard profile: ST period tuned to ~990 us "
+            "(~10 us margin at 1 kHz when trigger->ST phase shift is 0 us)."
+        ),
+        "st_high_time": 4e-6,
+        "st_low_time": 986e-6,
+        "st_initial_delay": 0.0,
+        "clk_high_time": 250e-9,
+        "clk_low_time": 250e-9,
+        "clk_initial_delay": 0.0,
+    }
+
     # Named profiles make it explicit which timing set is active.
     TIMING_PROFILES = {
         "main_1khz_safe": MAIN_1KHZ_SAFE_TIMING,
@@ -117,8 +133,9 @@ class PDAControllerDAQSimple:
         "improved_guess": IMPROVED_GUESS_TIMING,
         "improved_guess_2channel": IMPROVED_GUESS_TIMING_2CHANNEL,
         "toofast_guess": TOOFAST_GUESS_TIMING,
+        "guard_10us": GUARD_10US_TIMING,
     }
-    DEFAULT_TIMING_PROFILE = "txt_1khz_rebased"
+    DEFAULT_TIMING_PROFILE = "guard_10us"
 
     def __init__(
         self,
@@ -171,6 +188,10 @@ class PDAControllerDAQSimple:
         self.trigger_filter_enable = False
         self.trigger_filter_min_pulse_width_s = 0.2e-6
         self._trigger_filter_warned = False
+        self.trigger_sync_enable = True
+        self._trigger_sync_warned = False
+        self.retrigger_enable_initial_delay = True
+        self._retrigger_delay_warned = False
 
         # Video timing model:
         # - AI starts on ST falling edge by default.
@@ -277,6 +298,12 @@ class PDAControllerDAQSimple:
         if self.trigger_filter_min_pulse_width_s < 0:
             raise ValueError("min_pulse_width_s must be >= 0.")
 
+    def set_trigger_sync(self, enable=True):
+        self.trigger_sync_enable = bool(enable)
+
+    def set_retrigger_initial_delay(self, enable=True):
+        self.retrigger_enable_initial_delay = bool(enable)
+
     def _apply_trigger_filter_to_start_trigger(self, start_trigger):
         """
         Apply digital filter on external trigger path when supported.
@@ -294,6 +321,15 @@ class PDAControllerDAQSimple:
                     f"{self.trig_in}: {exc}"
                 )
                 self._trigger_filter_warned = True
+        try:
+            start_trigger.dig_edge_dig_sync_enable = bool(self.trigger_sync_enable)
+        except Exception as exc:
+            if not self._trigger_sync_warned:
+                print(
+                    "Warning: could not apply trigger digital synchronization on "
+                    f"{self.trig_in}: {exc}"
+                )
+                self._trigger_sync_warned = True
 
     def set_line_windowing(self, enable=True, ignored_samples=16, trailing_samples=10):
         if not enable:
@@ -790,6 +826,7 @@ class _RetriggerLineSession:
         self._buffer_size_warned = False
         self._tdms_warned = False
         self._latest_read_warned = False
+        self._latest_cursor_enabled = False
         self.last_lines_consumed = 1
 
     def __enter__(self):
@@ -848,13 +885,36 @@ class _RetriggerLineSession:
                 pass
 
         if self.latest_only_read:
-            # Latest-only mode is implemented in read_line() by draining all
-            # complete queued lines and keeping the newest complete line.
-            # This avoids stale-frame behavior seen with cursor-based
-            # MOST_RECENT_SAMPLE reads in retriggered segmented acquisitions.
-            pass
+            line_samples = int(self.pda.ai_samples_per_line)
+            try:
+                # NI recommendation for overwrite/latest mode:
+                # read relative to MOST_RECENT_SAMPLE with a negative offset.
+                self.ai_task.in_stream.relative_to = ReadRelativeTo.MOST_RECENT_SAMPLE
+                self.ai_task.in_stream.offset = -line_samples
+                self._latest_cursor_enabled = True
+            except Exception as exc:
+                self._latest_cursor_enabled = False
+                if not self._latest_read_warned:
+                    print(
+                        "Warning: could not configure MOST_RECENT_SAMPLE cursor. "
+                        "Falling back to queue-drain latest mode. "
+                        f"Detail: {exc}"
+                    )
+                    self._latest_read_warned = True
         self.st_task = self.pda._build_st_task()
         self.clk_task = self.pda._build_clk_task()
+        for task_obj, task_label in ((self.st_task, "ST"), (self.clk_task, "CLK")):
+            try:
+                task_obj.co_channels[0].co_enable_initial_delay_on_retrigger = bool(
+                    self.pda.retrigger_enable_initial_delay
+                )
+            except Exception as exc:
+                if not self.pda._retrigger_delay_warned:
+                    print(
+                        "Warning: could not set CO.EnableInitialDelayOnRetrigger "
+                        f"for {task_label} task: {exc}"
+                    )
+                    self.pda._retrigger_delay_warned = True
 
         self.pda._apply_start_trigger_chain(self.ai_task, self.st_task, self.clk_task)
         self.pda._set_retriggerable(self.ai_task, True)
@@ -870,6 +930,13 @@ class _RetriggerLineSession:
     def read_line(self, timeout=10.0):
         line_samples = int(self.pda.ai_samples_per_line)
         self.last_lines_consumed = 1
+
+        if self.latest_only_read and self._latest_cursor_enabled:
+            data = self.ai_task.read(
+                number_of_samples_per_channel=line_samples,
+                timeout=float(timeout),
+            )
+            return self.pda._format_ai_read_data(data, read_reference=self.read_reference)
 
         if self.latest_only_read:
             try:
@@ -941,7 +1008,10 @@ class _PFI9EdgeMonitorSession:
     def __init__(self, pda, counter="ctr2", rate_gate_s=0.05):
         self.pda = pda
         self.counter = f"{self.pda.device}/{str(counter).lstrip('/')}"
-        self.rate_gate_s = max(0.01, float(rate_gate_s))
+        # Allow short gates for higher-rate trigger diagnostics.
+        # This is an edge-rate monitor (not a waveform monitor), so shorter gates
+        # increase temporal sensitivity at the cost of noisier quantization.
+        self.rate_gate_s = max(0.001, float(rate_gate_s))
         self.task = None
         self.last_count = 0
         self.last_t = 0.0
@@ -954,12 +1024,27 @@ class _PFI9EdgeMonitorSession:
     def __enter__(self):
         try:
             self.task = nidaqmx.Task("PDA_PFI9_MON")
-            self.task.ci_channels.add_ci_count_edges_chan(
+            ch = self.task.ci_channels.add_ci_count_edges_chan(
                 counter=self.counter,
                 edge=Edge.RISING,
                 initial_count=0,
             )
             self.task.ci_channels[0].ci_count_edges_term = self.pda.trig_in
+            # PFI terminals are shared resources: if another task on this terminal
+            # enabled a digital filter, NI-DAQmx requires matching filter settings.
+            try:
+                ch.ci_count_edges_dig_fltr_enable = bool(self.pda.trigger_filter_enable)
+                if self.pda.trigger_filter_enable:
+                    ch.ci_count_edges_dig_fltr_min_pulse_width = float(
+                        self.pda.trigger_filter_min_pulse_width_s
+                    )
+            except Exception:
+                # Non-fatal: if unsupported, continue without explicit CI filter setup.
+                pass
+            try:
+                ch.ci_count_edges_dig_sync_enable = bool(self.pda.trigger_sync_enable)
+            except Exception:
+                pass
             self.task.start()
             self.last_count = int(self.task.read())
             self.last_t = time.perf_counter()
@@ -1080,6 +1165,460 @@ class _BackgroundLineReader:
         self._thread = None
 
 
+def _is_daq_buffer_overwrite_error(exc):
+    code = getattr(exc, "error_code", None)
+    if code == -200222:
+        return True
+    text = str(exc).lower()
+    return ("-200222" in text) or ("input buffer overwrite" in text)
+
+
+def _metric_score(auc_median, auc_std, trigger_eff, valid):
+    if not valid:
+        return float("-inf")
+    med = float(auc_median) if np.isfinite(auc_median) else float("-inf")
+    std = float(auc_std) if np.isfinite(auc_std) else 0.0
+    eff = float(trigger_eff) if np.isfinite(trigger_eff) else 0.0
+    return med - (0.25 * std) + (100.0 * eff)
+
+
+def evaluate_persistent_candidate(
+    pda,
+    expected_trigger_hz=1000.0,
+    evaluation_seconds=6.0,
+    acquisition_timeout_s=10.0,
+    monitor_pfi9=True,
+    pfi9_monitor_counter="ctr2",
+    pfi9_rate_gate_s=0.05,
+    ai_buffer_lines=2048,
+    queue_abort_fraction=0.80,
+):
+    """
+    Evaluate one persistent-retrigger timing candidate without plotting.
+
+    Returns a metrics dict with validity flag and score.
+    """
+    if not pda.use_external_trigger:
+        raise ValueError(
+            "Persistent candidate evaluation requires external trigger enabled."
+        )
+
+    eval_s = max(0.5, float(evaluation_seconds))
+    ai_buffer_lines = max(256, int(ai_buffer_lines))
+    queue_abort_fraction = min(0.98, max(0.05, float(queue_abort_fraction)))
+
+    auc_values = []
+    line_rate_hz_buffer = deque(maxlen=32)
+    pending_lines_buffer = deque(maxlen=128)
+    pfi9_rate_hz_buffer = deque(maxlen=128)
+    line_count = 0
+    lines_consumed_total = 0
+    max_pending_lines = 0.0
+    invalid_reason = None
+
+    t_wall_start = time.perf_counter()
+    monitor_context = (
+        _PFI9EdgeMonitorSession(
+            pda,
+            counter=pfi9_monitor_counter,
+            rate_gate_s=pfi9_rate_gate_s,
+        )
+        if monitor_pfi9
+        else nullcontext(None)
+    )
+
+    with _RetriggerLineSession(
+        pda,
+        ai_buffer_lines=ai_buffer_lines,
+        read_reference=False,
+        tdms_log_enable=False,
+        latest_only_read=False,
+        overwrite_unread=False,
+    ) as session, monitor_context as pfi9_monitor:
+        while (time.perf_counter() - t_wall_start) < eval_s:
+            pending_lines = float("nan")
+            try:
+                avail_samples = float(session.ai_task.in_stream.avail_samp_per_chan)
+                pending_lines = avail_samples / float(max(1, pda.ai_samples_per_line))
+                pending_lines_buffer.append(pending_lines)
+                max_pending_lines = max(max_pending_lines, pending_lines)
+            except Exception:
+                pass
+
+            if (
+                np.isfinite(pending_lines)
+                and pending_lines > (queue_abort_fraction * ai_buffer_lines)
+            ):
+                invalid_reason = (
+                    "queue_guard_abort:"
+                    f" pending={pending_lines:.1f} lines, "
+                    f"limit={queue_abort_fraction * ai_buffer_lines:.1f}"
+                )
+                break
+
+            t0 = time.perf_counter()
+            try:
+                data = session.read_line(timeout=float(acquisition_timeout_s))
+            except Exception as exc:
+                if _is_daq_buffer_overwrite_error(exc):
+                    invalid_reason = "buffer_overwrite_-200222"
+                    break
+                invalid_reason = f"read_error:{exc}"
+                break
+            t_read = max(1e-9, time.perf_counter() - t0)
+
+            lines_consumed = max(1, int(getattr(session, "last_lines_consumed", 1)))
+            lines_consumed_total += lines_consumed
+            line_count += 1
+            line_rate_hz_buffer.append(lines_consumed / t_read)
+
+            arr = np.asarray(data, dtype=float)
+            auc_values.append(float(np.trapz(arr, dx=1.0)))
+
+            if pfi9_monitor is not None and getattr(pfi9_monitor, "available", False):
+                pfi9_rate_hz, _ = pfi9_monitor.read_rate()
+                if np.isfinite(pfi9_rate_hz):
+                    pfi9_rate_hz_buffer.append(float(pfi9_rate_hz))
+
+    wall_elapsed_s = max(1e-9, time.perf_counter() - t_wall_start)
+    wall_line_rate_hz = lines_consumed_total / wall_elapsed_s
+    read_service_rate_hz = (
+        float(np.median(line_rate_hz_buffer))
+        if line_rate_hz_buffer
+        else float("nan")
+    )
+    pfi9_med_hz = (
+        float(np.median(pfi9_rate_hz_buffer))
+        if pfi9_rate_hz_buffer
+        else float("nan")
+    )
+    auc_arr = np.asarray(auc_values, dtype=float)
+    auc_median = float(np.median(auc_arr)) if auc_arr.size else float("nan")
+    auc_mean = float(np.mean(auc_arr)) if auc_arr.size else float("nan")
+    auc_std = float(np.std(auc_arr)) if auc_arr.size else float("nan")
+    auc_p10 = float(np.percentile(auc_arr, 10)) if auc_arr.size else float("nan")
+    auc_p90 = float(np.percentile(auc_arr, 90)) if auc_arr.size else float("nan")
+    queue_med = (
+        float(np.median(pending_lines_buffer))
+        if pending_lines_buffer
+        else float("nan")
+    )
+
+    if expected_trigger_hz > 0:
+        denom = (
+            pfi9_med_hz
+            if np.isfinite(pfi9_med_hz) and pfi9_med_hz > 0
+            else float(expected_trigger_hz)
+        )
+        trigger_eff = min(1.0, wall_line_rate_hz / max(1e-9, denom))
+    else:
+        trigger_eff = float("nan")
+
+    valid = (
+        invalid_reason is None
+        and auc_arr.size >= 8
+        and np.isfinite(auc_median)
+        and np.isfinite(wall_line_rate_hz)
+    )
+
+    score = _metric_score(
+        auc_median=auc_median,
+        auc_std=auc_std,
+        trigger_eff=trigger_eff,
+        valid=valid,
+    )
+
+    return {
+        "valid": bool(valid),
+        "invalid_reason": invalid_reason,
+        "score": float(score),
+        "line_count": int(line_count),
+        "lines_consumed_total": int(lines_consumed_total),
+        "wall_elapsed_s": float(wall_elapsed_s),
+        "wall_line_rate_hz": float(wall_line_rate_hz),
+        "read_service_rate_hz": float(read_service_rate_hz),
+        "pfi9_rate_median_hz": float(pfi9_med_hz),
+        "trigger_eff": float(trigger_eff),
+        "auc_median": float(auc_median),
+        "auc_mean": float(auc_mean),
+        "auc_std": float(auc_std),
+        "auc_p10": float(auc_p10),
+        "auc_p90": float(auc_p90),
+        "queue_median_lines": float(queue_med),
+        "queue_max_lines": float(max_pending_lines),
+        "ai_buffer_lines": int(ai_buffer_lines),
+        "queue_abort_fraction": float(queue_abort_fraction),
+    }
+
+
+def run_persistent_timing_sweep(
+    pda,
+    expected_trigger_hz=1000.0,
+    evaluation_seconds=6.0,
+    acquisition_timeout_s=10.0,
+    monitor_pfi9=True,
+    pfi9_monitor_counter="ctr2",
+    pfi9_rate_gate_s=0.05,
+    phase_coarse_start_us=0.0,
+    phase_coarse_stop_us=1000.0,
+    phase_coarse_step_us=25.0,
+    phase_fine_half_width_us=50.0,
+    phase_fine_step_us=5.0,
+    st_delay_half_width_us=100.0,
+    st_delay_step_us=10.0,
+    ai_buffer_lines=2048,
+    queue_abort_fraction=0.80,
+):
+    """
+    Automated persistent-mode timing sweep:
+    1) Baseline diagnostic at current settings
+    2) Trigger->ST phase coarse sweep + fine sweep
+    3) ST initial delay fine sweep
+    """
+    if not pda.use_external_trigger:
+        raise ValueError("Sweep mode requires external trigger enabled.")
+
+    phase_coarse_step_us = max(1e-3, float(phase_coarse_step_us))
+    phase_fine_step_us = max(1e-3, float(phase_fine_step_us))
+    st_delay_step_us = max(1e-3, float(st_delay_step_us))
+    rows = []
+
+    orig = {
+        "st_high": float(pda.st_high_time),
+        "st_low": float(pda.st_low_time),
+        "base_st_delay": float(pda.base_st_initial_delay),
+        "trigger_shift": float(pda.trigger_phase_shift_s),
+    }
+
+    def _evaluate_and_record(stage, phase_us, st_delay_us):
+        m = evaluate_persistent_candidate(
+            pda=pda,
+            expected_trigger_hz=expected_trigger_hz,
+            evaluation_seconds=evaluation_seconds,
+            acquisition_timeout_s=acquisition_timeout_s,
+            monitor_pfi9=monitor_pfi9,
+            pfi9_monitor_counter=pfi9_monitor_counter,
+            pfi9_rate_gate_s=pfi9_rate_gate_s,
+            ai_buffer_lines=ai_buffer_lines,
+            queue_abort_fraction=queue_abort_fraction,
+        )
+        row = {
+            "stage": str(stage),
+            "phase_shift_us": float(phase_us),
+            "st_initial_delay_us": float(st_delay_us),
+            **m,
+        }
+        rows.append(row)
+        validity = "OK" if m["valid"] else f"INVALID ({m['invalid_reason']})"
+        print(
+            f"[{stage}] phase={phase_us:.1f} us, st_delay={st_delay_us:.1f} us "
+            f"| AUCmed={m['auc_median']:.3f} | eff={100.0 * m['trigger_eff']:.1f}% "
+            f"| wall={m['wall_line_rate_hz']:.1f} Hz | score={m['score']:.3f} "
+            f"| {validity}"
+        )
+        return row
+
+    try:
+        print("Running persistent-mode baseline diagnostic...")
+        baseline = _evaluate_and_record(
+            stage="baseline",
+            phase_us=(pda.trigger_phase_shift_s * 1e6),
+            st_delay_us=(pda.base_st_initial_delay * 1e6),
+        )
+        if not baseline["valid"]:
+            print(
+                "Baseline is invalid before sweep; likely software/throughput path issue. "
+                "Sweep will continue, but results may be limited."
+            )
+        elif baseline["trigger_eff"] < 0.70:
+            print(
+                "Baseline trigger efficiency is low; software path may still be throughput-limited."
+            )
+        else:
+            print(
+                "Baseline path looks software-stable; proceeding to timing sweep."
+            )
+
+        coarse_values = np.arange(
+            float(phase_coarse_start_us),
+            float(phase_coarse_stop_us) + 0.5 * phase_coarse_step_us,
+            phase_coarse_step_us,
+        )
+        print(
+            "Coarse phase sweep: "
+            f"{coarse_values[0]:.1f} -> {coarse_values[-1]:.1f} us "
+            f"(step {phase_coarse_step_us:.1f} us)"
+        )
+        for phase_us in coarse_values:
+            pda.set_trigger_phase_shift(float(phase_us) * 1e-6)
+            _evaluate_and_record(
+                stage="phase_coarse",
+                phase_us=float(phase_us),
+                st_delay_us=(pda.base_st_initial_delay * 1e6),
+            )
+
+        valid_phase_rows = [
+            r for r in rows if r["stage"] in ("phase_coarse",) and r["valid"]
+        ]
+        if not valid_phase_rows:
+            raise RuntimeError(
+                "No valid points in phase coarse sweep. "
+                "Check trigger path/queue limits and rerun."
+            )
+        best_phase_coarse = max(valid_phase_rows, key=lambda r: r["score"])
+
+        phase_center_us = float(best_phase_coarse["phase_shift_us"])
+        phase_fine_values = np.arange(
+            phase_center_us - float(phase_fine_half_width_us),
+            phase_center_us + float(phase_fine_half_width_us) + 0.5 * phase_fine_step_us,
+            phase_fine_step_us,
+        )
+        # Counter initial delay cannot be negative on NI-DAQmx.
+        phase_fine_values = np.unique(np.clip(phase_fine_values, 0.0, None))
+        print(
+            "Fine phase sweep around best coarse: "
+            f"{phase_fine_values[0]:.1f} -> {phase_fine_values[-1]:.1f} us "
+            f"(step {phase_fine_step_us:.1f} us)"
+        )
+        for phase_us in phase_fine_values:
+            pda.set_trigger_phase_shift(float(phase_us) * 1e-6)
+            _evaluate_and_record(
+                stage="phase_fine",
+                phase_us=float(phase_us),
+                st_delay_us=(pda.base_st_initial_delay * 1e6),
+            )
+
+        valid_phase_all = [
+            r for r in rows if r["stage"] in ("phase_coarse", "phase_fine") and r["valid"]
+        ]
+        best_phase = max(valid_phase_all, key=lambda r: r["score"])
+        best_phase_us = float(best_phase["phase_shift_us"])
+        pda.set_trigger_phase_shift(best_phase_us * 1e-6)
+        print(f"Best phase shift so far: {best_phase_us:.1f} us")
+
+        st_center_us = float(pda.base_st_initial_delay * 1e6)
+        st_values = np.arange(
+            st_center_us - float(st_delay_half_width_us),
+            st_center_us + float(st_delay_half_width_us) + 0.5 * st_delay_step_us,
+            st_delay_step_us,
+        )
+        st_values = np.clip(st_values, 0.0, None)
+        print(
+            "ST initial-delay sweep: "
+            f"{st_values[0]:.1f} -> {st_values[-1]:.1f} us "
+            f"(step {st_delay_step_us:.1f} us)"
+        )
+        for st_us in st_values:
+            pda.set_st_timing(
+                high_time_s=pda.st_high_time,
+                low_time_s=pda.st_low_time,
+                initial_delay_s=float(st_us) * 1e-6,
+            )
+            _evaluate_and_record(
+                stage="st_delay_fine",
+                phase_us=best_phase_us,
+                st_delay_us=float(st_us),
+            )
+
+        valid_final = [
+            r for r in rows if r["stage"] in ("phase_coarse", "phase_fine", "st_delay_fine") and r["valid"]
+        ]
+        if not valid_final:
+            raise RuntimeError("Sweep produced no valid final candidates.")
+        best = max(valid_final, key=lambda r: r["score"])
+
+        best_phase_us = float(best["phase_shift_us"])
+        best_st_delay_us = float(best["st_initial_delay_us"])
+        pda.set_st_timing(
+            high_time_s=pda.st_high_time,
+            low_time_s=pda.st_low_time,
+            initial_delay_s=best_st_delay_us * 1e-6,
+        )
+        pda.set_trigger_phase_shift(best_phase_us * 1e-6)
+
+        out_dir = Path(__file__).resolve().parent / "optimization_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        csv_path = out_dir / f"persistent_timing_sweep_{ts}.csv"
+        json_path = out_dir / f"persistent_timing_sweep_{ts}.json"
+
+        csv_fields = [
+            "stage",
+            "phase_shift_us",
+            "st_initial_delay_us",
+            "valid",
+            "invalid_reason",
+            "score",
+            "line_count",
+            "lines_consumed_total",
+            "wall_elapsed_s",
+            "wall_line_rate_hz",
+            "read_service_rate_hz",
+            "pfi9_rate_median_hz",
+            "trigger_eff",
+            "auc_median",
+            "auc_mean",
+            "auc_std",
+            "auc_p10",
+            "auc_p90",
+            "queue_median_lines",
+            "queue_max_lines",
+            "ai_buffer_lines",
+            "queue_abort_fraction",
+        ]
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+
+        summary = {
+            "timestamp": ts,
+            "best": best,
+            "best_phase_shift_us": best_phase_us,
+            "best_st_initial_delay_us": best_st_delay_us,
+            "timing_profile_name": getattr(pda, "timing_profile_name", ""),
+            "rows_count": len(rows),
+            "csv_path": str(csv_path),
+            "json_path": str(json_path),
+            "settings": {
+                "expected_trigger_hz": float(expected_trigger_hz),
+                "evaluation_seconds": float(evaluation_seconds),
+                "phase_coarse_start_us": float(phase_coarse_start_us),
+                "phase_coarse_stop_us": float(phase_coarse_stop_us),
+                "phase_coarse_step_us": float(phase_coarse_step_us),
+                "phase_fine_half_width_us": float(phase_fine_half_width_us),
+                "phase_fine_step_us": float(phase_fine_step_us),
+                "st_delay_half_width_us": float(st_delay_half_width_us),
+                "st_delay_step_us": float(st_delay_step_us),
+                "ai_buffer_lines": int(ai_buffer_lines),
+                "queue_abort_fraction": float(queue_abort_fraction),
+            },
+        }
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+
+        print("Sweep complete.")
+        print(
+            "Best persistent candidate: "
+            f"phase={best_phase_us:.1f} us, st_delay={best_st_delay_us:.1f} us "
+            f"| AUCmed={best['auc_median']:.3f} | eff={100.0 * best['trigger_eff']:.1f}%"
+        )
+        print(f"Saved sweep CSV:  {csv_path}")
+        print(f"Saved sweep JSON: {json_path}")
+        return summary, rows
+    except Exception:
+        # Keep the most recent profile timings if sweep fails, but restore the
+        # original trigger shift and base ST delay for safety.
+        pda.set_st_timing(
+            high_time_s=orig["st_high"],
+            low_time_s=orig["st_low"],
+            initial_delay_s=orig["base_st_delay"],
+        )
+        pda.set_trigger_phase_shift(orig["trigger_shift"])
+        raise
+
+
 def run_live_plot(
     pda,
     integration_line_count=128,
@@ -1108,6 +1647,7 @@ def run_live_plot(
     tdms_logging_mode=LoggingMode.LOG_AND_READ,
     tdms_logging_operation=LoggingOperation.OPEN_OR_CREATE,
     decouple_acquisition_from_plot=True,
+    persistent_ai_buffer_lines=256,
     capture_hit_rate_enable=True,
     capture_hit_rate_window_lines=256,
     capture_hit_threshold_fraction=0.45,
@@ -1131,6 +1671,7 @@ def run_live_plot(
     retrigger_overwrite_unread = bool(retrigger_overwrite_unread)
     tdms_log_enable = bool(tdms_log_enable)
     decouple_acquisition_from_plot = bool(decouple_acquisition_from_plot)
+    persistent_ai_buffer_lines = max(64, int(persistent_ai_buffer_lines))
     plot_target_fps = max(1.0, float(plot_target_fps))
     capture_hit_rate_enable = bool(capture_hit_rate_enable)
     capture_hit_rate_window_lines = max(16, int(capture_hit_rate_window_lines))
@@ -1520,7 +2061,7 @@ def run_live_plot(
         session_context = (
             _RetriggerLineSession(
                 pda,
-                ai_buffer_lines=2048,
+                ai_buffer_lines=persistent_ai_buffer_lines,
                 read_reference=read_reference,
                 tdms_log_enable=tdms_log_enable,
                 tdms_file_path=tdms_file_path,
@@ -1550,9 +2091,15 @@ def run_live_plot(
                         f"(source: {pda.trig_in}, gate: {pfi9_monitor.rate_gate_s * 1e3:.0f} ms)."
                     )
                 elif getattr(pfi9_monitor, "error_text", ""):
+                    pfi9_err = str(getattr(pfi9_monitor, "error_text", ""))
+                    if "minimum pulse width" in pfi9_err.lower():
+                        pfi9_err += (
+                            " | Hint: PFI9 is shared; make trigger and monitor filter "
+                            "settings match, or disable one user of this terminal."
+                        )
                     print(
                         "PFI9 monitor unavailable; continuing without it: "
-                        f"{pfi9_monitor.error_text}"
+                        f"{pfi9_err}"
                     )
             reader = None
             reader_seq_last = 0
@@ -1594,6 +2141,13 @@ def run_live_plot(
                         if reader_exc is not None:
                             raise reader_exc
                         if packet is None or int(packet["seq"]) <= int(reader_seq_last):
+                            if (
+                                pfi9_monitor is not None
+                                and getattr(pfi9_monitor, "available", False)
+                            ):
+                                pfi9_rate_idle, _ = pfi9_monitor.read_rate()
+                                if np.isfinite(pfi9_rate_idle):
+                                    pfi9_rate_hz_buffer.append(float(pfi9_rate_idle))
                             plt.pause(0.001)
                             continue
 
@@ -2106,6 +2660,21 @@ def run_live_plot(
                     d = pda.get_timing_diagnostics(
                         trigger_frequency_hz=expected_trigger_hz
                     )
+                    if pfi9_monitor is None:
+                        pfi9_status_line = "PFI9 monitor: disabled"
+                    elif getattr(pfi9_monitor, "available", False):
+                        pfi9_status_line = (
+                            "PFI9 monitor: active "
+                            f"({pfi9_monitor.counter}, gate={pfi9_monitor.rate_gate_s * 1e3:.1f} ms)"
+                        )
+                    else:
+                        pfi9_err = str(getattr(pfi9_monitor, "error_text", "")).strip()
+                        if len(pfi9_err) > 90:
+                            pfi9_err = pfi9_err[:87] + "..."
+                        pfi9_status_line = (
+                            "PFI9 monitor: unavailable"
+                            + (f" ({pfi9_err})" if pfi9_err else "")
+                        )
                     pfi9_med = (
                         float(np.median(pfi9_rate_hz_buffer))
                         if pfi9_rate_hz_buffer
@@ -2123,6 +2692,7 @@ def run_live_plot(
                             f"{wall_line_rate_hz:.1f} Hz  "
                             f"Eff={100.0 * trigger_eff:.1f}%"
                         ),
+                        pfi9_status_line,
                         f"AUC main={integrated_auc_main:.6g} V*s",
                     ]
                     if np.isfinite(integrated_auc_ref):
@@ -2239,6 +2809,12 @@ if __name__ == "__main__":
         description="Simple live PDA/CMOS DAQ runner."
     )
     cli.add_argument(
+        "--operation",
+        default="live",
+        choices=("live", "sweep"),
+        help="Run live plotting or automated persistent timing sweep.",
+    )
+    cli.add_argument(
         "--timing-profile",
         default=PDAControllerDAQSimple.DEFAULT_TIMING_PROFILE,
         choices=sorted(PDAControllerDAQSimple.TIMING_PROFILES.keys()),
@@ -2248,6 +2824,95 @@ if __name__ == "__main__":
         "--list-timing-profiles",
         action="store_true",
         help="Print available timing profiles and exit.",
+    )
+    cli.add_argument(
+        "--plot-fps",
+        type=float,
+        default=None,
+        help="Live plot target FPS override (default from runtime profile).",
+    )
+    cli.add_argument(
+        "--plot-every-lines",
+        type=int,
+        default=None,
+        help="Update plot every N acquired lines (default from runtime profile).",
+    )
+    cli.add_argument(
+        "--timing-text-every-lines",
+        type=int,
+        default=None,
+        help="Refresh diagnostics text every N lines (default from runtime profile).",
+    )
+    cli.add_argument(
+        "--autoscale-every-updates",
+        type=int,
+        default=None,
+        help="Autoscale every N plot updates (default from runtime profile).",
+    )
+    cli.add_argument(
+        "--sweep-evaluation-seconds",
+        type=float,
+        default=6.0,
+        help="Per-point evaluation duration in seconds for sweep mode.",
+    )
+    cli.add_argument(
+        "--sweep-phase-coarse-start-us",
+        type=float,
+        default=0.0,
+        help="Coarse sweep start for trigger->ST phase shift (us).",
+    )
+    cli.add_argument(
+        "--sweep-phase-coarse-stop-us",
+        type=float,
+        default=1000.0,
+        help="Coarse sweep stop for trigger->ST phase shift (us).",
+    )
+    cli.add_argument(
+        "--sweep-phase-coarse-step-us",
+        type=float,
+        default=25.0,
+        help="Coarse sweep step for trigger->ST phase shift (us).",
+    )
+    cli.add_argument(
+        "--sweep-phase-fine-half-width-us",
+        type=float,
+        default=50.0,
+        help="Fine sweep half-width around best coarse phase (us).",
+    )
+    cli.add_argument(
+        "--sweep-phase-fine-step-us",
+        type=float,
+        default=5.0,
+        help="Fine sweep step for trigger->ST phase shift (us).",
+    )
+    cli.add_argument(
+        "--sweep-st-delay-half-width-us",
+        type=float,
+        default=100.0,
+        help="ST initial-delay fine sweep half-width (us).",
+    )
+    cli.add_argument(
+        "--sweep-st-delay-step-us",
+        type=float,
+        default=10.0,
+        help="ST initial-delay fine sweep step (us).",
+    )
+    cli.add_argument(
+        "--sweep-ai-buffer-lines",
+        type=int,
+        default=2048,
+        help="AI buffer lines used in persistent sweep evaluation.",
+    )
+    cli.add_argument(
+        "--sweep-queue-abort-fraction",
+        type=float,
+        default=0.80,
+        help="Abort a candidate if queue exceeds this fraction of buffer.",
+    )
+    cli.add_argument(
+        "--sweep-then-live",
+        action="store_true",
+        help="After sweep, continue into live plot with best settings.",
     )
     cli_args = cli.parse_args()
     if cli_args.list_timing_profiles:
@@ -2268,10 +2933,15 @@ if __name__ == "__main__":
     # Start disabled. If needed, enable with a small width such as 0.1-0.5 us.
     trigger_filter_enable = False
     trigger_filter_min_pulse_width_s = 0.2e-6
+    trigger_sync_enable = True
     pda.set_trigger_filter(
         enable=trigger_filter_enable,
         min_pulse_width_s=trigger_filter_min_pulse_width_s,
     )
+    pda.set_trigger_sync(trigger_sync_enable)
+    # Critical for retriggered counter timing: re-apply initial_delay on every
+    # retriggered pulse train, not just the first trigger.
+    pda.set_retrigger_initial_delay(True)
 
     # Video timing control:
     # - start_on_st_fall=True: begin sampling at first CLK rising edge after ST low.
@@ -2295,6 +2965,7 @@ if __name__ == "__main__":
     pda.apply_timing_profile(timing_profile_name)
     print(f"Timing profile: {timing_profile_name}")
     # Deterministic phase shift from trigger edge to ST rise (shifts ST+CLK together).
+    # Default phase shift.
     trigger_to_st_phase_shift_us = 0.0
     pda.set_trigger_phase_shift(trigger_to_st_phase_shift_us * 1e-6)
     print(f"Trigger->ST phase shift: {trigger_to_st_phase_shift_us:.1f} us")
@@ -2317,6 +2988,7 @@ if __name__ == "__main__":
     demod_trigger_qualified_acceptance = True
     expected_trigger_hz = 1000.0
     acquisition_timeout_s = 50.0
+    persistent_ai_buffer_lines = 256
     # Runtime profile:
     # - "persistent_latest_test": arm once, read latest line, drop backlog.
     # - "persistent_robust_test": arm once, decoupled sequential reads, no overwrite.
@@ -2350,6 +3022,7 @@ if __name__ == "__main__":
         plot_target_fps = 10.0
         timing_text_update_every_n_lines = 200
         autoscale_every_n_plot_updates = 12
+        persistent_ai_buffer_lines = 256
     elif acquisition_runtime_profile == "persistent_robust_test":
         # Persistent retriggered + decoupled acquisition, but keep line integrity:
         # - read sequentially (no latest-only slicing)
@@ -2359,10 +3032,12 @@ if __name__ == "__main__":
         retrigger_overwrite_unread = False
         decouple_acquisition_from_plot = True
         demod_trigger_qualified_acceptance = False
-        plot_update_every_n_lines = 20
-        plot_target_fps = 10.0
-        timing_text_update_every_n_lines = 200
-        autoscale_every_n_plot_updates = 12
+        # Default live cadence tuned for responsive plotting.
+        plot_update_every_n_lines = 2
+        plot_target_fps = 25.0
+        timing_text_update_every_n_lines = 40
+        autoscale_every_n_plot_updates = 8
+        persistent_ai_buffer_lines = 256
     elif acquisition_runtime_profile == "safe":
         # Per-line task build/start.
         use_persistent_session = False
@@ -2374,23 +3049,72 @@ if __name__ == "__main__":
         plot_target_fps = 15.0
         timing_text_update_every_n_lines = 100
         autoscale_every_n_plot_updates = 8
+        persistent_ai_buffer_lines = 256
     else:
         raise ValueError(
             "Unknown acquisition_runtime_profile. "
             "Use 'persistent_latest_test', 'persistent_robust_test', or 'safe'."
         )
 
+    # Optional live plotting cadence overrides.
+    if cli_args.plot_fps is not None:
+        plot_target_fps = max(1.0, float(cli_args.plot_fps))
+    if cli_args.plot_every_lines is not None:
+        plot_update_every_n_lines = max(1, int(cli_args.plot_every_lines))
+    if cli_args.timing_text_every_lines is not None:
+        timing_text_update_every_n_lines = max(1, int(cli_args.timing_text_every_lines))
+    if cli_args.autoscale_every_updates is not None:
+        autoscale_every_n_plot_updates = max(1, int(cli_args.autoscale_every_updates))
+
     monitor_pfi9 = True
     pfi9_monitor_counter = "ctr2"
     # Robust trigger-rate estimate gate. Larger gate = smoother/slower response.
-    pfi9_rate_gate_s = 0.10
-    trigger_plot_history = 240
+    pfi9_rate_gate_s = 0.002
+    trigger_plot_history = 1200
     # Lightweight capture hit-rate diagnostic:
     # score = Vpp(main line), threshold adapts from recent score distribution.
     capture_hit_rate_enable = True
     capture_hit_rate_window_lines = 256
     capture_hit_threshold_fraction = 0.45
     capture_hit_warmup_lines = 64
+
+    if cli_args.operation == "sweep":
+        print("\n=== Persistent Sweep Mode ===")
+        print(
+            "Sweep enforces robust persistent settings: "
+            "external trigger on, main-only, demod off, "
+            "latest_only=False, overwrite_unread=False."
+        )
+        live_video_mode = "main"
+        pump_chop_demod = False
+        demod_trigger_qualified_acceptance = False
+        use_persistent_session = True
+        retrigger_latest_only_read = False
+        retrigger_overwrite_unread = False
+        decouple_acquisition_from_plot = True
+        tdms_log_enable = False
+
+        run_persistent_timing_sweep(
+            pda=pda,
+            expected_trigger_hz=expected_trigger_hz,
+            evaluation_seconds=cli_args.sweep_evaluation_seconds,
+            acquisition_timeout_s=acquisition_timeout_s,
+            monitor_pfi9=monitor_pfi9,
+            pfi9_monitor_counter=pfi9_monitor_counter,
+            pfi9_rate_gate_s=pfi9_rate_gate_s,
+            phase_coarse_start_us=cli_args.sweep_phase_coarse_start_us,
+            phase_coarse_stop_us=cli_args.sweep_phase_coarse_stop_us,
+            phase_coarse_step_us=cli_args.sweep_phase_coarse_step_us,
+            phase_fine_half_width_us=cli_args.sweep_phase_fine_half_width_us,
+            phase_fine_step_us=cli_args.sweep_phase_fine_step_us,
+            st_delay_half_width_us=cli_args.sweep_st_delay_half_width_us,
+            st_delay_step_us=cli_args.sweep_st_delay_step_us,
+            ai_buffer_lines=cli_args.sweep_ai_buffer_lines,
+            queue_abort_fraction=cli_args.sweep_queue_abort_fraction,
+        )
+        if not cli_args.sweep_then_live:
+            raise SystemExit(0)
+        print("\nSweep finished. Entering live mode with best settings...\n")
 
     run_live_plot(
         pda=pda,
@@ -2420,6 +3144,7 @@ if __name__ == "__main__":
         tdms_logging_mode=tdms_logging_mode,
         tdms_logging_operation=tdms_logging_operation,
         decouple_acquisition_from_plot=decouple_acquisition_from_plot,
+        persistent_ai_buffer_lines=persistent_ai_buffer_lines,
         capture_hit_rate_enable=capture_hit_rate_enable,
         capture_hit_rate_window_lines=capture_hit_rate_window_lines,
         capture_hit_threshold_fraction=capture_hit_threshold_fraction,
