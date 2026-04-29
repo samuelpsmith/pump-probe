@@ -1,3 +1,27 @@
+"""
+DAQ_pda_hard.py
+================
+
+Hardware-timed NI-DAQmx runner for Hamamatsu line-scan CMOS readout.
+
+This script supports two operational modes:
+1) Live acquisition/plotting (`--operation live`)
+2) Persistent retrigger timing sweep (`--operation sweep`)
+
+Key architecture:
+- ST and CLK are generated from NI counters.
+- AI sampling is clocked by the CLK counter internal output (hardware timing).
+- External trigger (PFI9) can retrigger the ST/CLK/AI chain.
+
+Common usage:
+- Live default run:
+  `python DAQ_pda_hard.py`
+- Live with explicit plot cadence:
+  `python DAQ_pda_hard.py --plot-fps 25 --plot-every-lines 2 --timing-text-every-lines 40 --autoscale-every-updates 8`
+- Timing sweep:
+  `python DAQ_pda_hard.py --operation sweep`
+"""
+
 import numpy as np
 import nidaqmx
 import matplotlib.pyplot as plt
@@ -12,12 +36,33 @@ from collections import deque
 from nidaqmx.constants import (
     AcquisitionType,
     Edge,
+    ExportAction,
     Level,
     TerminalConfiguration,
     LoggingMode,
     LoggingOperation,
     OverwriteMode,
+    Polarity,
     ReadRelativeTo,
+)
+
+RUNTIME_PROFILE_PERSISTENT_LATEST = "persistent_latest_test"
+RUNTIME_PROFILE_PERSISTENT_ROBUST = "persistent_robust_test"
+RUNTIME_PROFILE_SAFE = "safe"
+RUNTIME_PROFILE_CHOICES = (
+    RUNTIME_PROFILE_PERSISTENT_LATEST,
+    RUNTIME_PROFILE_PERSISTENT_ROBUST,
+    RUNTIME_PROFILE_SAFE,
+)
+RUNTIME_PROFILE_DEFAULT = RUNTIME_PROFILE_PERSISTENT_ROBUST
+
+LIVE_PRESET_DEFAULT = "default"
+LIVE_PRESET_SIGNAL_ONLY = "signal_only"
+LIVE_PRESET_TRIGGER_DEBUG = "trigger_debug"
+LIVE_PRESET_CHOICES = (
+    LIVE_PRESET_DEFAULT,
+    LIVE_PRESET_SIGNAL_ONLY,
+    LIVE_PRESET_TRIGGER_DEBUG,
 )
 
 
@@ -146,6 +191,7 @@ class PDAControllerDAQSimple:
         trig_pfi="PFI9",
         st_pfi="PFI8",
         clk_pfi="PFI4",
+        chopper_sync_pfi="PFI3",
     ):
         self.device = str(device)
         self.num_pixels = int(num_pixels)
@@ -155,9 +201,11 @@ class PDAControllerDAQSimple:
         self.trig_in = f"/{self.device}/{trig_pfi}"
         self.st_out_term = f"/{self.device}/{st_pfi}"
         self.clk_out_term = f"/{self.device}/{clk_pfi}"
+        self.chopper_sync_out_term = f"/{self.device}/{chopper_sync_pfi}"
 
         self.st_counter = f"{self.device}/ctr0"
         self.clk_counter = f"{self.device}/ctr1"
+        self.chopper_sync_counter = f"{self.device}/ctr3"
         self.st_internal_output = f"/{self.device}/Ctr0InternalOutput"
         self.ai_sample_clk_src = f"/{self.device}/Ctr1InternalOutput"
 
@@ -192,6 +240,12 @@ class PDAControllerDAQSimple:
         self._trigger_sync_warned = False
         self.retrigger_enable_initial_delay = True
         self._retrigger_delay_warned = False
+        self.chopper_sync_enable = False
+        self.chopper_sync_source_terminal = self.trig_in
+        self.chopper_sync_initial_delay_ticks = 0
+        self.chopper_sync_high_ticks = 2
+        self.chopper_sync_low_ticks = 2
+        self._chopper_sync_warned = False
 
         # Video timing model:
         # - AI starts on ST falling edge by default.
@@ -300,6 +354,33 @@ class PDAControllerDAQSimple:
 
     def set_trigger_sync(self, enable=True):
         self.trigger_sync_enable = bool(enable)
+
+    def set_chopper_sync_output(
+        self,
+        enable=True,
+        out_pfi="PFI3",
+        source_terminal=None,
+        initial_delay_ticks=0,
+        high_ticks=2,
+        low_ticks=2,
+    ):
+        """
+        Configure a hardware-timed chopper sync output.
+
+        By default this exports a terminal-count pulse every two edges of the
+        external trigger stream on ``PFI9`` using a spare counter and routes
+        the resulting 500 Hz TTL sync pulse train to ``PFI3``. This keeps the
+        chopper reference derived from the same source as the line-acquisition
+        trigger without adding per-line software load.
+        """
+        self.chopper_sync_enable = bool(enable)
+        self.chopper_sync_out_term = f"/{self.device}/{str(out_pfi).lstrip('/')}"
+        self.chopper_sync_source_terminal = (
+            self.trig_in if source_terminal in (None, "") else str(source_terminal)
+        )
+        self.chopper_sync_initial_delay_ticks = max(0, int(initial_delay_ticks))
+        self.chopper_sync_high_ticks = max(1, int(high_ticks))
+        self.chopper_sync_low_ticks = max(1, int(low_ticks))
 
     def set_retrigger_initial_delay(self, enable=True):
         self.retrigger_enable_initial_delay = bool(enable)
@@ -1099,24 +1180,114 @@ class _PFI9EdgeMonitorSession:
         return False
 
 
+class _ChopperSyncOutSession:
+    """
+    Generate a hardware chopper reference on PFI3 from the PFI9 trigger stream.
+
+    This uses a spare counter in pulse-ticks mode, with the incoming trigger
+    used as the tick source. For the default 1 kHz trigger and 1 high tick /
+    1 low tick, the output is a phase-derived 500 Hz TTL reference.
+    """
+
+    def __init__(self, pda):
+        self.pda = pda
+        self.task = None
+        self.available = False
+        self.error_text = ""
+
+    def __enter__(self):
+        if not self.pda.chopper_sync_enable:
+            return self
+        try:
+            self.task = nidaqmx.Task("PDA_CHOP_SYNC")
+            ch = self.task.co_channels.add_co_pulse_chan_ticks(
+                counter=self.pda.chopper_sync_counter,
+                source_terminal=self.pda.chopper_sync_source_terminal,
+                idle_state=Level.LOW,
+                initial_delay=self.pda.chopper_sync_initial_delay_ticks,
+                low_ticks=self.pda.chopper_sync_low_ticks,
+                high_ticks=self.pda.chopper_sync_high_ticks,
+            )
+            # For divide-by-2 sync we want a short pulse on each terminal count,
+            # not the counter's regular pulse-train output terminal. Exporting
+            # the counter output event in pulse mode yields one TTL pulse every
+            # two source edges when high/low ticks are both set to 2.
+            self.task.export_signals.ctr_out_event_output_term = (
+                self.pda.chopper_sync_out_term
+            )
+            self.task.export_signals.ctr_out_event_output_behavior = (
+                ExportAction.PULSE
+            )
+            self.task.export_signals.ctr_out_event_pulse_polarity = (
+                Polarity.ACTIVE_HIGH
+            )
+            try:
+                ch.co_ctr_timebase_dig_sync_enable = bool(
+                    self.pda.trigger_sync_enable
+                )
+            except Exception:
+                pass
+            try:
+                ch.co_ctr_timebase_dig_fltr_enable = bool(
+                    self.pda.trigger_filter_enable
+                )
+                if self.pda.trigger_filter_enable:
+                    ch.co_ctr_timebase_dig_fltr_min_pulse_width = float(
+                        self.pda.trigger_filter_min_pulse_width_s
+                    )
+            except Exception:
+                pass
+            self.task.timing.cfg_implicit_timing(
+                sample_mode=AcquisitionType.CONTINUOUS
+            )
+            self.task.start()
+            self.available = True
+        except Exception as exc:
+            self.error_text = str(exc)
+            self.available = False
+            self.close()
+        return self
+
+    def close(self):
+        if self.task is not None:
+            try:
+                self.task.stop()
+            except Exception:
+                pass
+            try:
+                self.task.close()
+            except Exception:
+                pass
+        self.task = None
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 class _BackgroundLineReader:
     """
     Background DAQ line reader.
 
-    Reads lines continuously in a worker thread and keeps the latest packet
-    plus cumulative counters, so plotting can run at its own pace.
+    Reads lines continuously in a worker thread and stores them in FIFO order.
+
+    This preserves shot ordering for pump-chop odd/even demod while still
+    decoupling acquisition from plotting. When the FIFO fills, the reader
+    applies backpressure rather than silently dropping lines.
     """
 
-    def __init__(self, read_fn):
+    def __init__(self, read_fn, max_packets=256):
         self.read_fn = read_fn
-        self._lock = threading.Lock()
+        self._cond = threading.Condition()
         self._stop = threading.Event()
         self._thread = None
-        self._latest = None
+        self._packets = deque()
         self._error = None
         self._seq = 0
         self._lines_total = 0
         self._acq_total_s = 0.0
+        self._max_packets = max(8, int(max_packets))
+        self._max_queue_depth = 0
 
     def start(self):
         if self._thread is not None:
@@ -1135,22 +1306,565 @@ class _BackgroundLineReader:
             try:
                 data, lines_consumed = self.read_fn()
             except Exception as exc:
-                with self._lock:
+                with self._cond:
                     self._error = exc
+                    self._cond.notify_all()
                 return
 
             elapsed_s = max(0.0, time.perf_counter() - t0)
             consumed = max(1, int(lines_consumed))
-            with self._lock:
+            with self._cond:
+                while (
+                    len(self._packets) >= self._max_packets
+                    and not self._stop.is_set()
+                ):
+                    self._cond.wait(timeout=0.05)
+                if self._stop.is_set():
+                    return
                 self._seq += 1
                 self._lines_total += consumed
                 self._acq_total_s += elapsed_s
-                self._latest = {
-                    "seq": int(self._seq),
-                    "data": data,
-                    "lines_total": int(self._lines_total),
-                    "acq_total_s": float(self._acq_total_s),
-                }
+                self._packets.append(
+                    {
+                        "seq": int(self._seq),
+                        "data": data,
+                        "lines_total": int(self._lines_total),
+                        "acq_total_s": float(self._acq_total_s),
+                        "elapsed_s": float(elapsed_s),
+                    }
+                )
+                self._max_queue_depth = max(self._max_queue_depth, len(self._packets))
+                self._cond.notify_all()
+
+    def pop_next(self, wait_timeout_s=0.0):
+        wait_timeout_s = max(0.0, float(wait_timeout_s))
+        with self._cond:
+            if (
+                wait_timeout_s > 0.0
+                and not self._packets
+                and self._error is None
+                and not self._stop.is_set()
+            ):
+                self._cond.wait(timeout=wait_timeout_s)
+            packet = self._packets.popleft() if self._packets else None
+            if packet is not None:
+                self._cond.notify_all()
+            err = self._error
+            depth = len(self._packets)
+            max_depth = self._max_queue_depth
+        return packet, err, depth, max_depth
+
+    def close(self, join_timeout_s=1.0):
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=max(0.0, float(join_timeout_s)))
+        self._thread = None
+
+
+class _LiveLineAccumulator:
+    """Maintain running raw/integrated/demod state for live plotting."""
+
+    def __init__(
+        self,
+        initial_size,
+        integration_line_count=128,
+        pump_chop_demod=False,
+        pump_chop_sign=-1.0,
+        pump_chop_use_adjacent_pairs=False,
+        pump_chop_sign_agnostic_preview=False,
+        capture_hit_rate_enable=True,
+        capture_hit_rate_window_lines=256,
+        capture_hit_warmup_lines=64,
+        capture_hit_threshold_fraction=0.45,
+    ):
+        self.integration_line_count = max(1, int(integration_line_count))
+        self.pump_chop_demod = bool(pump_chop_demod)
+        self.pump_chop_sign = float(pump_chop_sign)
+        self.pump_chop_use_adjacent_pairs = bool(pump_chop_use_adjacent_pairs)
+        self.pump_chop_sign_agnostic_preview = bool(
+            pump_chop_sign_agnostic_preview
+        )
+        self.capture_hit_rate_enable = bool(capture_hit_rate_enable)
+        self.capture_hit_rate_window_lines = max(
+            16, int(capture_hit_rate_window_lines)
+        )
+        self.capture_hit_warmup_lines = max(8, int(capture_hit_warmup_lines))
+        self.capture_hit_threshold_fraction = min(
+            1.0, max(0.0, float(capture_hit_threshold_fraction))
+        )
+        self.capture_score_recent = deque(
+            maxlen=max(
+                self.capture_hit_rate_window_lines,
+                self.capture_hit_warmup_lines,
+                128,
+            )
+        )
+        self.capture_hit_flags = deque(maxlen=self.capture_hit_rate_window_lines)
+        self.line_counter = 0
+        self.demod_accept_count = 0
+        self.demod_reject_count = 0
+        self.demod_reject_missing_count = 0
+        self.demod_multi_edge_count = 0
+        self.demod_reject_no_prev_count = 0
+        self.demod_last_line_phase = None
+        self.chop_phase = 0
+        self.chop_prev_line = None
+        self.chop_prev_phase = None
+        self.chop_pair_counter = 0
+        self.chop_preview_flip_counter = 0
+        self.chop_parity_reset_counter = 0
+        self.chop_preview_template = None
+        self.chop_parity_warned = False
+        self._pending_parity_reset = False
+        self._pending_parity_reset_reason = ""
+        self.last_warning_message = None
+        self._reset_size(int(initial_size))
+
+    def _reset_size(self, size):
+        size = max(1, int(size))
+        self.size = size
+        self.line_buffer = deque(maxlen=self.integration_line_count)
+        self.integration_sum = np.zeros(size, dtype=float)
+        self.ref_line_buffer = deque(maxlen=self.integration_line_count)
+        self.ref_integration_sum = np.zeros(size, dtype=float)
+        self.chop_phase0_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_phase1_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_phase0_sum = np.zeros(size, dtype=float)
+        self.chop_phase1_sum = np.zeros(size, dtype=float)
+        self.chop_pair_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_pair_sum = np.zeros(size, dtype=float)
+        self.latest_line = np.zeros(size, dtype=float)
+        self.integrated_line = np.zeros(size, dtype=float)
+        self.ref_line = None
+        self.ref_integrated_line = None
+        self.diff_line = None
+        self.diff_integrated_line = None
+        self.latest_chop_pair = None
+        self.latest_chop_integrated = None
+        self.integrated_auc_main = float("nan")
+        self.integrated_auc_ref = float("nan")
+        self.integrated_auc_diff = float("nan")
+        self.capture_hit_rate_pct = float("nan")
+        self.capture_last_score_vpp = float("nan")
+        self.capture_last_threshold_vpp = float("nan")
+        self.capture_score_recent.clear()
+        self.capture_hit_flags.clear()
+        self.chop_phase = 0
+        self.chop_prev_line = None
+        self.chop_prev_phase = None
+        self.chop_pair_counter = 0
+        self.chop_preview_flip_counter = 0
+        self.chop_parity_reset_counter = 0
+        self.chop_preview_template = None
+        self.demod_last_line_phase = None
+
+    def request_parity_reset(self, reason):
+        self._pending_parity_reset = True
+        self._pending_parity_reset_reason = str(reason)
+
+    def _apply_parity_reset(self, reason):
+        self.chop_phase = 0
+        self.chop_prev_line = None
+        self.chop_prev_phase = None
+        self.demod_last_line_phase = None
+        self.chop_phase0_buffer.clear()
+        self.chop_phase1_buffer.clear()
+        self.chop_phase0_sum = np.zeros(self.size, dtype=float)
+        self.chop_phase1_sum = np.zeros(self.size, dtype=float)
+        self.chop_pair_buffer.clear()
+        self.chop_pair_sum = np.zeros(self.size, dtype=float)
+        self.latest_chop_pair = None
+        self.latest_chop_integrated = None
+        self.chop_preview_template = None
+        self.chop_parity_reset_counter += 1
+        if not self.chop_parity_warned:
+            self.last_warning_message = (
+                "Warning: reset chop demod parity due to trigger/line discontinuity "
+                f"({reason})."
+            )
+            self.chop_parity_warned = True
+
+    def process_line(
+        self,
+        line,
+        ref_line=None,
+        lines_consumed=1,
+        demod_qual_active=False,
+        edge_delta_since_last_line=None,
+    ):
+        self.last_warning_message = None
+        line = np.asarray(line, dtype=float)
+        ref_arr = None if ref_line is None else np.asarray(ref_line, dtype=float)
+        if line.size != self.size:
+            self._reset_size(line.size)
+            self.request_parity_reset("line size changed")
+
+        self.line_counter += max(1, int(lines_consumed))
+        self.latest_line = line.copy()
+        self.ref_line = None if ref_arr is None else ref_arr.copy()
+
+        if len(self.line_buffer) == self.line_buffer.maxlen:
+            self.integration_sum -= self.line_buffer.popleft()
+        self.line_buffer.append(line.copy())
+        self.integration_sum += line
+        self.integrated_line = self.integration_sum / float(len(self.line_buffer))
+
+        if ref_arr is not None:
+            if len(self.ref_line_buffer) == self.ref_line_buffer.maxlen:
+                self.ref_integration_sum -= self.ref_line_buffer.popleft()
+            self.ref_line_buffer.append(ref_arr.copy())
+            self.ref_integration_sum += ref_arr
+            self.ref_integrated_line = (
+                self.ref_integration_sum / float(len(self.ref_line_buffer))
+            )
+            self.diff_line = self.latest_line - self.ref_line
+            self.diff_integrated_line = (
+                self.integrated_line - self.ref_integrated_line
+            )
+        else:
+            self.ref_integrated_line = None
+            self.diff_line = None
+            self.diff_integrated_line = None
+
+        self.integrated_auc_main = float(np.trapz(self.integrated_line))
+        if self.ref_integrated_line is not None:
+            self.integrated_auc_ref = float(np.trapz(self.ref_integrated_line))
+            self.integrated_auc_diff = float(np.trapz(self.diff_integrated_line))
+        else:
+            self.integrated_auc_ref = float("nan")
+            self.integrated_auc_diff = float("nan")
+
+        if self.capture_hit_rate_enable:
+            capture_score = float(np.ptp(self.latest_line))
+            self.capture_last_score_vpp = capture_score
+            self.capture_score_recent.append(capture_score)
+            if len(self.capture_score_recent) >= self.capture_hit_warmup_lines:
+                score_arr = np.asarray(self.capture_score_recent, dtype=float)
+                score_lo = float(np.quantile(score_arr, 0.10))
+                score_hi = float(np.quantile(score_arr, 0.90))
+                score_span = max(1e-12, score_hi - score_lo)
+                capture_threshold = (
+                    score_lo + self.capture_hit_threshold_fraction * score_span
+                )
+                self.capture_last_threshold_vpp = capture_threshold
+                self.capture_hit_flags.append(capture_score >= capture_threshold)
+                self.capture_hit_rate_pct = (
+                    100.0 * float(np.mean(self.capture_hit_flags))
+                    if self.capture_hit_flags
+                    else float("nan")
+                )
+
+        if not self.pump_chop_demod:
+            return
+
+        parity_reset_needed = False
+        local_reset_reason = ""
+        if self._pending_parity_reset:
+            parity_reset_needed = True
+            local_reset_reason = self._pending_parity_reset_reason
+            self._pending_parity_reset = False
+            self._pending_parity_reset_reason = ""
+
+        demod_line_accepted = True
+        demod_line_phase = None
+        if demod_qual_active:
+            if edge_delta_since_last_line is None:
+                if self.demod_last_line_phase is None:
+                    demod_line_phase = 0
+                else:
+                    demod_line_accepted = False
+                    self.demod_reject_no_prev_count += 1
+                    local_reset_reason = (
+                        "trigger-qualified reject (no previous edge sample)"
+                    )
+            elif edge_delta_since_last_line <= 0:
+                demod_line_accepted = False
+                self.demod_reject_missing_count += 1
+                local_reset_reason = "trigger-qualified reject (missing edge)"
+            else:
+                step_edges = int(edge_delta_since_last_line)
+                if step_edges > 1:
+                    self.demod_multi_edge_count += 1
+                if self.demod_last_line_phase is None:
+                    demod_line_phase = 0
+                else:
+                    demod_line_phase = int(
+                        self.demod_last_line_phase ^ (step_edges & 1)
+                    )
+
+            if demod_line_accepted:
+                self.demod_accept_count += 1
+                self.demod_last_line_phase = int(
+                    0 if demod_line_phase is None else demod_line_phase
+                )
+            else:
+                self.demod_reject_count += 1
+                parity_reset_needed = True
+                self.latest_chop_pair = None
+                self.latest_chop_integrated = None
+
+        if parity_reset_needed:
+            self._apply_parity_reset(local_reset_reason)
+
+        if not demod_line_accepted:
+            return
+
+        if self.pump_chop_use_adjacent_pairs:
+            if self.pump_chop_sign_agnostic_preview:
+                if self.chop_prev_line is None:
+                    self.chop_prev_line = self.latest_line.copy()
+                    self.latest_chop_pair = None
+                    self.latest_chop_integrated = None
+                else:
+                    chop_pair = self.pump_chop_sign * (
+                        self.latest_line - self.chop_prev_line
+                    )
+                    if (
+                        self.chop_preview_template is not None
+                        and np.any(np.isfinite(self.chop_preview_template))
+                    ):
+                        template_dot = float(
+                            np.dot(chop_pair, self.chop_preview_template)
+                        )
+                        if template_dot < 0.0:
+                            chop_pair = -chop_pair
+                            self.chop_preview_flip_counter += 1
+                    self.chop_pair_counter += 1
+                    self.latest_chop_pair = chop_pair
+                    if len(self.chop_pair_buffer) == self.chop_pair_buffer.maxlen:
+                        self.chop_pair_sum -= self.chop_pair_buffer.popleft()
+                    self.chop_pair_buffer.append(chop_pair.copy())
+                    self.chop_pair_sum += chop_pair
+                    self.latest_chop_integrated = self.chop_pair_sum / float(
+                        len(self.chop_pair_buffer)
+                    )
+                    self.chop_preview_template = self.latest_chop_integrated.copy()
+                    self.chop_prev_line = self.latest_line.copy()
+            else:
+                if demod_qual_active:
+                    current_phase = int(
+                        0 if demod_line_phase is None else demod_line_phase
+                    )
+                else:
+                    current_phase = int(self.chop_phase ^ ((lines_consumed - 1) & 1))
+                    self.chop_phase = int(self.chop_phase ^ (lines_consumed & 1))
+                if self.chop_prev_line is None:
+                    self.chop_prev_line = self.latest_line.copy()
+                    self.chop_prev_phase = current_phase
+                    self.latest_chop_pair = None
+                    self.latest_chop_integrated = None
+                else:
+                    make_pair = (
+                        (self.chop_prev_phase is None)
+                        or (current_phase != self.chop_prev_phase)
+                    )
+                    if make_pair:
+                        chop_pair = self.pump_chop_sign * (
+                            self.latest_line - self.chop_prev_line
+                        )
+                        self.chop_pair_counter += 1
+                        self.latest_chop_pair = chop_pair
+                        if len(self.chop_pair_buffer) == self.chop_pair_buffer.maxlen:
+                            self.chop_pair_sum -= self.chop_pair_buffer.popleft()
+                        self.chop_pair_buffer.append(chop_pair.copy())
+                        self.chop_pair_sum += chop_pair
+                        self.latest_chop_integrated = self.chop_pair_sum / float(
+                            len(self.chop_pair_buffer)
+                        )
+                    else:
+                        self.latest_chop_pair = None
+                    self.chop_prev_line = self.latest_line.copy()
+                    self.chop_prev_phase = current_phase
+            return
+
+        if demod_qual_active:
+            current_phase = int(0 if demod_line_phase is None else demod_line_phase)
+        else:
+            current_phase = int(self.chop_phase ^ ((lines_consumed - 1) & 1))
+            self.chop_phase = int(self.chop_phase ^ (lines_consumed & 1))
+
+        if current_phase == 0:
+            if len(self.chop_phase0_buffer) == self.chop_phase0_buffer.maxlen:
+                self.chop_phase0_sum -= self.chop_phase0_buffer.popleft()
+            self.chop_phase0_buffer.append(self.latest_line.copy())
+            self.chop_phase0_sum += self.latest_line
+        else:
+            if len(self.chop_phase1_buffer) == self.chop_phase1_buffer.maxlen:
+                self.chop_phase1_sum -= self.chop_phase1_buffer.popleft()
+            self.chop_phase1_buffer.append(self.latest_line.copy())
+            self.chop_phase1_sum += self.latest_line
+
+        if self.chop_prev_line is None:
+            self.chop_prev_line = self.latest_line.copy()
+            self.chop_prev_phase = current_phase
+            self.latest_chop_pair = None
+        else:
+            make_pair = (
+                (self.chop_prev_phase is None)
+                or (current_phase != self.chop_prev_phase)
+            )
+            if make_pair:
+                chop_pair = self.pump_chop_sign * (
+                    self.latest_line - self.chop_prev_line
+                )
+                self.chop_pair_counter += 1
+                self.latest_chop_pair = chop_pair
+            else:
+                self.latest_chop_pair = None
+            self.chop_prev_line = self.latest_line.copy()
+            self.chop_prev_phase = current_phase
+
+        if len(self.chop_phase0_buffer) > 0 and len(self.chop_phase1_buffer) > 0:
+            phase0_mean = self.chop_phase0_sum / float(len(self.chop_phase0_buffer))
+            phase1_mean = self.chop_phase1_sum / float(len(self.chop_phase1_buffer))
+            self.latest_chop_integrated = self.pump_chop_sign * (
+                phase1_mean - phase0_mean
+            )
+        else:
+            self.latest_chop_integrated = None
+
+    def snapshot(self):
+        return {
+            "line_counter": int(self.line_counter),
+            "line": self.latest_line.copy(),
+            "integrated_line": self.integrated_line.copy(),
+            "ref_line": None if self.ref_line is None else self.ref_line.copy(),
+            "ref_integrated_line": (
+                None
+                if self.ref_integrated_line is None
+                else self.ref_integrated_line.copy()
+            ),
+            "diff_line": None if self.diff_line is None else self.diff_line.copy(),
+            "diff_integrated_line": (
+                None
+                if self.diff_integrated_line is None
+                else self.diff_integrated_line.copy()
+            ),
+            "latest_chop_pair": (
+                None if self.latest_chop_pair is None else self.latest_chop_pair.copy()
+            ),
+            "latest_chop_integrated": (
+                None
+                if self.latest_chop_integrated is None
+                else self.latest_chop_integrated.copy()
+            ),
+            "integrated_auc_main": float(self.integrated_auc_main),
+            "integrated_auc_ref": float(self.integrated_auc_ref),
+            "integrated_auc_diff": float(self.integrated_auc_diff),
+            "capture_hit_rate_pct": float(self.capture_hit_rate_pct),
+            "capture_last_score_vpp": float(self.capture_last_score_vpp),
+            "capture_last_threshold_vpp": float(self.capture_last_threshold_vpp),
+            "capture_warmup_count": int(len(self.capture_score_recent)),
+            "line_buffer_len": int(len(self.line_buffer)),
+            "phase0_buffer_len": int(len(self.chop_phase0_buffer)),
+            "phase1_buffer_len": int(len(self.chop_phase1_buffer)),
+            "pair_buffer_len": int(len(self.chop_pair_buffer)),
+            "chop_pair_counter": int(self.chop_pair_counter),
+            "chop_preview_flip_counter": int(self.chop_preview_flip_counter),
+            "chop_parity_reset_counter": int(self.chop_parity_reset_counter),
+            "demod_accept_count": int(self.demod_accept_count),
+            "demod_reject_count": int(self.demod_reject_count),
+            "demod_reject_missing_count": int(self.demod_reject_missing_count),
+            "demod_multi_edge_count": int(self.demod_multi_edge_count),
+            "demod_reject_no_prev_count": int(self.demod_reject_no_prev_count),
+            "last_warning_message": self.last_warning_message,
+        }
+
+
+class _BackgroundAccumulatorProcessor:
+    """Read ordered lines continuously and publish reduced live snapshots."""
+
+    def __init__(
+        self,
+        read_fn,
+        accumulator,
+        read_reference=False,
+        snapshot_interval_s=0.02,
+    ):
+        self.read_fn = read_fn
+        self.accumulator = accumulator
+        self.read_reference = bool(read_reference)
+        self.snapshot_interval_s = max(0.005, float(snapshot_interval_s))
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._latest = None
+        self._error = None
+        self._snapshot_seq = 0
+        self._line_rate_buffer = deque(maxlen=32)
+        self._wall_start_t = None
+        self._wall_total_lines = 0
+        self._next_snapshot_t = 0.0
+
+    def start(self):
+        if self._thread is not None:
+            return self
+        self._thread = threading.Thread(
+            target=self._run,
+            name="PDA_BackgroundAccumulator",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _publish_snapshot(self, now):
+        service_rate_hz = (
+            float(np.median(self._line_rate_buffer)) if self._line_rate_buffer else 0.0
+        )
+        wall_elapsed_s = (
+            max(1e-6, now - self._wall_start_t)
+            if self._wall_start_t is not None
+            else 1e-6
+        )
+        wall_line_rate_hz = self._wall_total_lines / wall_elapsed_s
+        snap = self.accumulator.snapshot()
+        snap["service_rate_hz"] = float(service_rate_hz)
+        snap["wall_line_rate_hz"] = float(wall_line_rate_hz)
+        self._snapshot_seq += 1
+        snap["snapshot_seq"] = int(self._snapshot_seq)
+        with self._lock:
+            self._latest = snap
+
+    def _run(self):
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                data, lines_consumed = self.read_fn()
+            except Exception as exc:
+                with self._lock:
+                    self._error = exc
+                return
+            elapsed_s = max(1e-9, time.perf_counter() - t0)
+            consumed = max(1, int(lines_consumed))
+            if self.read_reference:
+                if not (isinstance(data, dict) and "main" in data and "reference" in data):
+                    with self._lock:
+                        self._error = RuntimeError(
+                            "Expected {'main','reference'} data in background processor."
+                        )
+                    return
+                line = np.asarray(data["main"], dtype=float)
+                ref_line = np.asarray(data["reference"], dtype=float)
+            else:
+                line = np.asarray(data, dtype=float)
+                ref_line = None
+            self.accumulator.process_line(
+                line,
+                ref_line=ref_line,
+                lines_consumed=consumed,
+                demod_qual_active=False,
+                edge_delta_since_last_line=None,
+            )
+            self._line_rate_buffer.append(consumed / elapsed_s)
+            now = time.perf_counter()
+            if self._wall_start_t is None:
+                self._wall_start_t = now
+            self._wall_total_lines += consumed
+            if (self._latest is None) or (now >= self._next_snapshot_t):
+                self._publish_snapshot(now)
+                self._next_snapshot_t = now + self.snapshot_interval_s
 
     def snapshot(self):
         with self._lock:
@@ -1166,6 +1880,7 @@ class _BackgroundLineReader:
 
 
 def _is_daq_buffer_overwrite_error(exc):
+    """Return True if an exception corresponds to NI-DAQmx buffer overwrite (-200222)."""
     code = getattr(exc, "error_code", None)
     if code == -200222:
         return True
@@ -1174,6 +1889,14 @@ def _is_daq_buffer_overwrite_error(exc):
 
 
 def _metric_score(auc_median, auc_std, trigger_eff, valid):
+    """
+    Score function for sweep ranking.
+
+    Higher is better:
+    - rewards higher median signal area,
+    - penalizes variation,
+    - rewards trigger efficiency.
+    """
     if not valid:
         return float("-inf")
     med = float(auc_median) if np.isfinite(auc_median) else float("-inf")
@@ -1625,8 +2348,11 @@ def run_live_plot(
     plot_raw_line=True,
     live_video_mode="main",
     pump_chop_demod=False,
-    pump_chop_sign=1.0,
+    pump_chop_sign=-1.0,
     pump_chop_use_adjacent_pairs=False,
+    pump_chop_sign_agnostic_preview=False,
+    pump_chop_dark_subtract=True,
+    pump_chop_dark_file=None,
     demod_trigger_qualified_acceptance=True,
     expected_trigger_hz=1000.0,
     acquisition_timeout_s=10.0,
@@ -1648,11 +2374,24 @@ def run_live_plot(
     tdms_logging_operation=LoggingOperation.OPEN_OR_CREATE,
     decouple_acquisition_from_plot=True,
     persistent_ai_buffer_lines=256,
+    reader_fifo_max_packets=256,
     capture_hit_rate_enable=True,
     capture_hit_rate_window_lines=256,
     capture_hit_threshold_fraction=0.45,
     capture_hit_warmup_lines=64,
 ):
+    """
+    Acquire and plot live lines from the CMOS/PDA chain.
+
+    Supports:
+    - safe per-line task build/start mode,
+    - persistent retriggered session mode,
+    - optional background-reader decoupling,
+    - optional pump-chop demod diagnostics,
+    - optional saved pump-dark baseline subtraction for integrated demod traces,
+    - optional sign-agnostic adjacent-pair preview demod,
+    - optional PFI9 edge-rate monitoring.
+    """
     def _is_buffer_overwrite_error(exc):
         code = getattr(exc, "error_code", None)
         if code == -200222:
@@ -1666,12 +2405,15 @@ def run_live_plot(
     pump_chop_demod = bool(pump_chop_demod)
     pump_chop_sign = float(pump_chop_sign)
     pump_chop_use_adjacent_pairs = bool(pump_chop_use_adjacent_pairs)
+    pump_chop_sign_agnostic_preview = bool(pump_chop_sign_agnostic_preview)
+    pump_chop_dark_subtract = bool(pump_chop_dark_subtract)
     demod_trigger_qualified_acceptance = bool(demod_trigger_qualified_acceptance)
     retrigger_latest_only_read = bool(retrigger_latest_only_read)
     retrigger_overwrite_unread = bool(retrigger_overwrite_unread)
     tdms_log_enable = bool(tdms_log_enable)
     decouple_acquisition_from_plot = bool(decouple_acquisition_from_plot)
     persistent_ai_buffer_lines = max(64, int(persistent_ai_buffer_lines))
+    reader_fifo_max_packets = max(8, int(reader_fifo_max_packets))
     plot_target_fps = max(1.0, float(plot_target_fps))
     capture_hit_rate_enable = bool(capture_hit_rate_enable)
     capture_hit_rate_window_lines = max(16, int(capture_hit_rate_window_lines))
@@ -1681,9 +2423,13 @@ def run_live_plot(
         1.0, max(0.0, capture_hit_threshold_fraction)
     )
     demod_mode_label = (
-        "adjacent pairs"
-        if pump_chop_use_adjacent_pairs
-        else "phase buckets"
+        "adjacent preview"
+        if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+        else (
+            "adjacent pairs"
+            if pump_chop_use_adjacent_pairs
+            else "odd/even buckets"
+        )
     )
     if pump_chop_sign == 0:
         raise ValueError("pump_chop_sign must be non-zero.")
@@ -1692,6 +2438,99 @@ def run_live_plot(
     pda._validate_scan_rate(num_ai_channels=(2 if read_reference else 1))
 
     x = np.arange(pda.output_samples_per_line)
+    if pump_chop_dark_file in (None, ""):
+        pump_chop_dark_path = (
+            Path(__file__).resolve().parent
+            / "acquisition_results"
+            / "pump_chop_dark_offset_latest.npz"
+        )
+    else:
+        pump_chop_dark_path = Path(pump_chop_dark_file).expanduser()
+    pump_chop_dark_path.parent.mkdir(parents=True, exist_ok=True)
+    pump_chop_dark_offset = None
+    pump_chop_dark_status = (
+        "disabled"
+        if not pump_chop_dark_subtract
+        else f"ready ({pump_chop_dark_path.name})"
+    )
+
+    def _set_pump_dark_status(text):
+        nonlocal pump_chop_dark_status
+        pump_chop_dark_status = str(text)
+
+    def _save_pump_dark_offset(trace):
+        trace = np.asarray(trace, dtype=float)
+        np.savez(
+            pump_chop_dark_path,
+            demod_integrated=trace,
+            sample_index=np.arange(trace.size, dtype=int),
+            pump_chop_sign=np.asarray([pump_chop_sign], dtype=float),
+            demod_mode=np.asarray([demod_mode_label]),
+            timestamp=np.asarray([time.strftime("%Y-%m-%d %H:%M:%S")]),
+        )
+
+    def _load_pump_dark_offset(print_message=True):
+        nonlocal pump_chop_dark_offset
+        if not pump_chop_dark_subtract:
+            pump_chop_dark_offset = None
+            _set_pump_dark_status("disabled")
+            if print_message:
+                print("Pump-dark subtraction is disabled; not loading dark offset.")
+            return False
+        if not pump_chop_dark_path.exists():
+            pump_chop_dark_offset = None
+            _set_pump_dark_status("missing")
+            if print_message:
+                print(
+                    "Pump-dark load skipped: file not found at "
+                    f"{pump_chop_dark_path}"
+                )
+            return False
+        with np.load(pump_chop_dark_path, allow_pickle=False) as npz_file:
+            if "demod_integrated" not in npz_file:
+                raise KeyError("demod_integrated not present in pump-dark file.")
+            loaded = np.asarray(npz_file["demod_integrated"], dtype=float)
+        if loaded.size != x.size:
+            pump_chop_dark_offset = None
+            _set_pump_dark_status(f"size mismatch ({loaded.size}!={x.size})")
+            if print_message:
+                print(
+                    "Pump-dark load skipped: sample-count mismatch "
+                    f"({loaded.size} vs current {x.size})."
+                )
+            return False
+        pump_chop_dark_offset = loaded.copy()
+        _set_pump_dark_status(f"active ({pump_chop_dark_path.name})")
+        if print_message:
+            print(
+                "Pump-dark offset loaded from "
+                f"{pump_chop_dark_path} and will be subtracted from the "
+                "integrated pump-chop trace."
+            )
+        return True
+
+    def _apply_pump_dark_offset(trace):
+        if trace is None:
+            return None
+        if pump_chop_dark_offset is None or not pump_chop_dark_subtract:
+            return trace
+        trace_arr = np.asarray(trace, dtype=float)
+        if pump_chop_dark_offset.size != trace_arr.size:
+            return trace_arr
+        return trace_arr - pump_chop_dark_offset
+
+    def _format_demod_title():
+        dark_label = ""
+        if pump_chop_dark_subtract:
+            dark_label = (
+                ", dark-subtracted"
+                if pump_chop_dark_offset is not None
+                else ", dark-ready"
+            )
+        return (
+            f"Pump-Chop Difference ({demod_mode_label}, "
+            f"sign {pump_chop_sign:+.0f}{dark_label})"
+        )
 
     plt.ion()
     if pump_chop_demod and monitor_pfi9:
@@ -1817,14 +2656,22 @@ def run_live_plot(
             linewidth=1.0,
             alpha=0.45,
             color="tab:purple",
-            label="Chop pair raw (adjacent)",
+            label=(
+                "Chop pair raw (sign-aligned preview)"
+                if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+                else "Chop pair raw (adjacent)"
+            ),
         )
         chop_integrated_line_plot, = ax_demod.plot(
             x,
             np.zeros_like(x, dtype=float),
             linewidth=1.9,
             color="tab:purple",
-            label=f"Chop integrated ({integration_line_count} lines/phase)",
+            label=(
+                f"Chop integrated ({integration_line_count} pairs, sign-aligned)"
+                if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+                else f"Chop integrated ({integration_line_count} lines/phase)"
+            ),
         )
         ax_demod.axhline(
             0.0,
@@ -1834,9 +2681,7 @@ def run_live_plot(
         )
         if not plot_raw_line:
             chop_raw_line_plot.set_visible(False)
-        ax_demod.set_title(
-            f"Pump-Chop Difference ({demod_mode_label}, sign {pump_chop_sign:+.0f})"
-        )
+        ax_demod.set_title(_format_demod_title())
         ax_demod.set_ylabel("Delta V (V)")
         ax_demod.set_xlabel("Sample Index")
         ax_demod.set_xlim(0, max(1, x.size - 1))
@@ -1870,11 +2715,15 @@ def run_live_plot(
     plt.show(block=False)
 
     use_fast_session = bool(use_persistent_session and pda.use_external_trigger)
-    line_mode = (
-        "persistent retriggered session"
-        if use_fast_session
-        else "per-line task build/start"
-    )
+    if use_fast_session:
+        if decouple_acquisition_from_plot and not retrigger_latest_only_read:
+            line_mode = "persistent retriggered session (background ordered processor)"
+        elif decouple_acquisition_from_plot:
+            line_mode = "persistent retriggered session (latest-view reader)"
+        else:
+            line_mode = "persistent retriggered session"
+    else:
+        line_mode = "per-line task build/start"
     mode_badge_label = "FAST"
     mode_badge_color = "#d9f2d9"
     if not use_fast_session:
@@ -1892,15 +2741,30 @@ def run_live_plot(
         "Pump chop demod: "
         f"{pump_chop_demod} "
         + (
-            f"(adjacent mode: {pump_chop_sign:+.0f} * (line[n]-line[n-1]))"
-            if pump_chop_use_adjacent_pairs
-            else f"(phase mode: {pump_chop_sign:+.0f} * (phase1-phase0))"
+            (
+                " (adjacent preview: consecutive accepted-line pairs, "
+                "sign-aligned to running template; absolute sign arbitrary)"
+            )
+            if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+            else (
+                f"(adjacent mode: {pump_chop_sign:+.0f} * (line[n]-line[n-1]))"
+                if pump_chop_use_adjacent_pairs
+                else (
+                    f"(odd/even mode: {pump_chop_sign:+.0f} * "
+                    "(mean(odd accepted lines)-mean(even accepted lines)))"
+                )
+            )
         )
     )
     print(
         "Demod trigger-qualified acceptance: "
         f"{demod_trigger_qualified_acceptance}"
     )
+    if pump_chop_demod:
+        print(
+            "Pump-dark baseline: "
+            f"{pump_chop_dark_status} | hotkeys: d=save/apply, l=load, x=clear"
+        )
     if demod_trigger_qualified_acceptance and use_fast_session:
         print(
             "Note: trigger-qualified acceptance is only exact in safe mode. "
@@ -1916,11 +2780,41 @@ def run_live_plot(
     print(
         "Acq/plot decoupling: "
         f"{(use_fast_session and decouple_acquisition_from_plot)}"
+        + (
+            " (background ordered processor)"
+            if (
+                use_fast_session
+                and decouple_acquisition_from_plot
+                and not retrigger_latest_only_read
+            )
+            else (
+                f" (FIFO, max {reader_fifo_max_packets} packets)"
+                if (use_fast_session and decouple_acquisition_from_plot)
+                else ""
+            )
+        )
     )
     print(
         f"Live plot target FPS: {plot_target_fps:.1f} "
         f"(line-gate every {max(1, int(plot_update_every_n_lines))} lines)"
     )
+    if pda.chopper_sync_enable:
+        chopper_divisor = (
+            0.5 * (pda.chopper_sync_high_ticks + pda.chopper_sync_low_ticks)
+        )
+        chopper_sync_hz = (
+            expected_trigger_hz / float(chopper_divisor)
+            if expected_trigger_hz > 0
+            else float("nan")
+        )
+        print(
+            "Chopper sync out: "
+            f"enabled on {pda.chopper_sync_out_term} "
+            f"from {pda.chopper_sync_source_terminal} "
+            f"(ticks high/low={pda.chopper_sync_high_ticks}/"
+            f"{pda.chopper_sync_low_ticks}, "
+            f"expected~{chopper_sync_hz:.1f} Hz)"
+        )
     if use_fast_session:
         print(
             "Retriggered read mode: "
@@ -1997,9 +2891,11 @@ def run_live_plot(
     chop_pair_buffer = deque(maxlen=max(1, int(integration_line_count)))
     chop_pair_sum = np.zeros_like(x, dtype=float)
     chop_pair_counter = 0
+    chop_preview_flip_counter = 0
     chop_parity_reset_counter = 0
     latest_chop_pair = None
     latest_chop_integrated = None
+    chop_preview_template = None
     chop_prev_phase = None
     line_rate_hz_buffer = deque(maxlen=32)
     wall_start_t = None
@@ -2050,12 +2946,54 @@ def run_live_plot(
     integrated_auc_main = float("nan")
     integrated_auc_ref = float("nan")
     integrated_auc_diff = float("nan")
+    latest_chop_integrated_display = None
 
     original_video_main = pda.video_main
     reader = None
+    processor = None
+    processor_snapshot_seq_last = 0
+    processor_last_warning = None
+    reader_queue_depth = float("nan")
+    reader_queue_max_depth = 0.0
     if ref_only:
         # Repoint single-channel reads to the configured reference input.
         pda.video_main = pda.video_ref
+
+    def _on_key_press(event):
+        nonlocal pump_chop_dark_offset
+        if not pump_chop_demod:
+            return
+        key = str(getattr(event, "key", "") or "").lower()
+        if key == "d":
+            if latest_chop_integrated is None:
+                print(
+                    "Pump-dark capture skipped: no integrated pump-chop trace "
+                    "is available yet."
+                )
+                return
+            trace = np.asarray(latest_chop_integrated, dtype=float)
+            _save_pump_dark_offset(trace)
+            pump_chop_dark_offset = trace.copy()
+            _set_pump_dark_status(f"active ({pump_chop_dark_path.name})")
+            print(
+                "Saved current integrated pump-chop trace as dark offset to "
+                f"{pump_chop_dark_path} and enabled subtraction."
+            )
+        elif key == "l":
+            try:
+                _load_pump_dark_offset(print_message=True)
+            except Exception as exc:
+                print(f"Pump-dark load failed: {exc}")
+        elif key == "x":
+            pump_chop_dark_offset = None
+            _set_pump_dark_status(
+                "ready ({})".format(pump_chop_dark_path.name)
+                if pump_chop_dark_subtract
+                else "disabled"
+            )
+            print("Cleared in-memory pump-dark subtraction.")
+
+    fig.canvas.mpl_connect("key_press_event", _on_key_press)
 
     try:
         session_context = (
@@ -2074,6 +3012,11 @@ def run_live_plot(
             if use_fast_session
             else nullcontext(None)
         )
+        chopper_sync_context = (
+            _ChopperSyncOutSession(pda)
+            if pda.chopper_sync_enable
+            else nullcontext(None)
+        )
         monitor_context = (
             _PFI9EdgeMonitorSession(
                 pda,
@@ -2083,7 +3026,41 @@ def run_live_plot(
             if monitor_pfi9
             else nullcontext(None)
         )
-        with session_context as session, monitor_context as pfi9_monitor:
+        with (
+            session_context as session,
+            chopper_sync_context as chopper_sync,
+            monitor_context as pfi9_monitor,
+        ):
+            if pda.chopper_sync_enable:
+                if (
+                    chopper_sync is not None
+                    and getattr(chopper_sync, "available", False)
+                ):
+                    print(
+                        "Chopper sync output active on "
+                        f"{pda.chopper_sync_out_term} "
+                        f"(source: {pda.chopper_sync_source_terminal})."
+                    )
+                elif (
+                    chopper_sync is not None
+                    and getattr(chopper_sync, "error_text", "")
+                ):
+                    print(
+                        "Warning: chopper sync output unavailable; continuing without it: "
+                        f"{str(getattr(chopper_sync, 'error_text', ''))}"
+                    )
+            accumulator = _LiveLineAccumulator(
+                initial_size=int(pda.output_samples_per_line),
+                integration_line_count=integration_line_count,
+                pump_chop_demod=pump_chop_demod,
+                pump_chop_sign=pump_chop_sign,
+                pump_chop_use_adjacent_pairs=pump_chop_use_adjacent_pairs,
+                pump_chop_sign_agnostic_preview=pump_chop_sign_agnostic_preview,
+                capture_hit_rate_enable=capture_hit_rate_enable,
+                capture_hit_rate_window_lines=capture_hit_rate_window_lines,
+                capture_hit_warmup_lines=capture_hit_warmup_lines,
+                capture_hit_threshold_fraction=capture_hit_threshold_fraction,
+            )
             if pfi9_monitor is not None:
                 if getattr(pfi9_monitor, "available", False):
                     print(
@@ -2102,23 +3079,44 @@ def run_live_plot(
                         f"{pfi9_err}"
                     )
             reader = None
-            reader_seq_last = 0
-            reader_lines_total_last = 0
-            reader_acq_total_last_s = 0.0
-            if session is not None and decouple_acquisition_from_plot:
+            processor = None
+            if (
+                session is not None
+                and decouple_acquisition_from_plot
+                and not retrigger_latest_only_read
+            ):
+                def _processor_pull():
+                    fast_data = session.read_line(timeout=acquisition_timeout_s)
+                    fast_lines = int(getattr(session, "last_lines_consumed", 1))
+                    return fast_data, max(1, fast_lines)
+
+                processor = _BackgroundAccumulatorProcessor(
+                    _processor_pull,
+                    accumulator=accumulator,
+                    read_reference=read_reference,
+                    snapshot_interval_s=max(0.005, 0.5 * plot_update_interval_s),
+                ).start()
+                print(
+                    "Background processor enabled: ordered acquisition plus "
+                    "odd/even accumulation now run off the GUI thread."
+                )
+            elif session is not None and decouple_acquisition_from_plot:
                 def _reader_pull():
                     fast_data = session.read_line(timeout=acquisition_timeout_s)
                     fast_lines = int(getattr(session, "last_lines_consumed", 1))
                     return fast_data, max(1, fast_lines)
 
-                reader = _BackgroundLineReader(_reader_pull).start()
+                reader = _BackgroundLineReader(
+                    _reader_pull,
+                    max_packets=reader_fifo_max_packets,
+                ).start()
                 print(
                     "Background reader enabled: DAQ acquisition decoupled "
-                    "from plotting loop."
+                    "from plotting loop with strict FIFO ordering."
                 )
             while True:
                 pending_lines = float("nan")
-                if session is not None and reader is None:
+                if session is not None:
                     try:
                         avail_samples = float(session.ai_task.in_stream.avail_samp_per_chan)
                         pending_lines = avail_samples / float(max(1, pda.ai_samples_per_line))
@@ -2132,15 +3130,440 @@ def run_live_plot(
                             )
                             queue_probe_warned = True
 
+                if processor is not None:
+                    try:
+                        snap, processor_exc = processor.snapshot()
+                        if processor_exc is not None:
+                            raise processor_exc
+                        if (
+                            snap is None
+                            or int(snap.get("snapshot_seq", 0))
+                            <= int(processor_snapshot_seq_last)
+                        ):
+                            if (
+                                pfi9_monitor is not None
+                                and getattr(pfi9_monitor, "available", False)
+                            ):
+                                pfi9_rate_idle, _ = pfi9_monitor.read_rate()
+                                if np.isfinite(pfi9_rate_idle):
+                                    pfi9_rate_hz_buffer.append(float(pfi9_rate_idle))
+                            plt.pause(0.001)
+                            continue
+                        processor_snapshot_seq_last = int(snap["snapshot_seq"])
+                        read_service_rate_hz = float(snap["service_rate_hz"])
+                        wall_line_rate_hz = float(snap["wall_line_rate_hz"])
+                        line_counter = int(snap["line_counter"])
+                        line = np.asarray(snap["line"], dtype=float)
+                        integrated_line = np.asarray(
+                            snap["integrated_line"], dtype=float
+                        )
+                        ref_line = (
+                            None
+                            if snap["ref_line"] is None
+                            else np.asarray(snap["ref_line"], dtype=float)
+                        )
+                        ref_integrated_line = (
+                            None
+                            if snap["ref_integrated_line"] is None
+                            else np.asarray(snap["ref_integrated_line"], dtype=float)
+                        )
+                        diff_line = (
+                            None
+                            if snap["diff_line"] is None
+                            else np.asarray(snap["diff_line"], dtype=float)
+                        )
+                        diff_integrated_line = (
+                            None
+                            if snap["diff_integrated_line"] is None
+                            else np.asarray(snap["diff_integrated_line"], dtype=float)
+                        )
+                        latest_chop_pair = (
+                            None
+                            if snap["latest_chop_pair"] is None
+                            else np.asarray(snap["latest_chop_pair"], dtype=float)
+                        )
+                        latest_chop_integrated = (
+                            None
+                            if snap["latest_chop_integrated"] is None
+                            else np.asarray(
+                                snap["latest_chop_integrated"], dtype=float
+                            )
+                        )
+                        integrated_auc_main = float(snap["integrated_auc_main"])
+                        integrated_auc_ref = float(snap["integrated_auc_ref"])
+                        integrated_auc_diff = float(snap["integrated_auc_diff"])
+                        capture_hit_rate_pct = float(snap["capture_hit_rate_pct"])
+                        capture_last_score_vpp = float(snap["capture_last_score_vpp"])
+                        capture_last_threshold_vpp = float(
+                            snap["capture_last_threshold_vpp"]
+                        )
+                        capture_warmup_count = int(snap["capture_warmup_count"])
+                        chop_pair_counter = int(snap["chop_pair_counter"])
+                        chop_preview_flip_counter = int(
+                            snap["chop_preview_flip_counter"]
+                        )
+                        chop_parity_reset_counter = int(
+                            snap["chop_parity_reset_counter"]
+                        )
+                        line_buffer_len = int(snap["line_buffer_len"])
+                        phase0_buffer_len = int(snap["phase0_buffer_len"])
+                        phase1_buffer_len = int(snap["phase1_buffer_len"])
+                        pair_buffer_len = int(snap["pair_buffer_len"])
+                        warning_text = snap.get("last_warning_message")
+                        if (
+                            warning_text
+                            and warning_text != processor_last_warning
+                        ):
+                            print(warning_text)
+                            processor_last_warning = warning_text
+                    except Exception as exc:
+                        if session is not None and _is_buffer_overwrite_error(exc):
+                            median_pending = (
+                                float(np.median(pending_lines_buffer))
+                                if pending_lines_buffer
+                                else float("nan")
+                            )
+                            expected = (
+                                float(expected_trigger_hz)
+                                if expected_trigger_hz > 0
+                                else float("nan")
+                            )
+                            print(
+                                "\nFast-mode diagnostics before fallback: "
+                                f"service_rate~{read_service_rate_hz:.1f} Hz, "
+                                f"wall_rate~{wall_line_rate_hz:.1f} Hz, "
+                                f"expected_trigger~{expected:.1f} Hz, "
+                                f"median_queue~{median_pending:.1f} lines, "
+                                f"max_queue~{max_pending_lines:.1f} lines, "
+                                f"buffer~{session.ai_buffer_lines} lines."
+                            )
+                            print(
+                                "\nWarning: retriggered session hit buffer overwrite "
+                                "(-200222). Falling back to safe per-line mode."
+                            )
+                            try:
+                                processor.close()
+                            except Exception:
+                                pass
+                            processor = None
+                            try:
+                                session.close()
+                            except Exception as close_exc:
+                                if not fallback_close_warned:
+                                    print(
+                                        "Warning: fast-session close during fallback "
+                                        f"reported an error. Detail: {close_exc}"
+                                    )
+                                    fallback_close_warned = True
+                            session = None
+                            line_mode = "per-line task build/start (fallback)"
+                            print(f"Acquisition mode: {line_mode}")
+                            mode_badge_label = "SAFE-FALLBACK"
+                            mode_badge_color = "#f7d9d9"
+                            mode_text.set_text(mode_badge_label)
+                            mode_text.set_bbox(
+                                {
+                                    "facecolor": mode_badge_color,
+                                    "alpha": 0.85,
+                                    "edgecolor": "none",
+                                }
+                            )
+                            accumulator.request_parity_reset(
+                                "fast-session fallback/possible line loss"
+                            )
+                            continue
+                        raise
+
+                    pfi9_rate_hz = float("nan")
+                    if pfi9_monitor is not None and getattr(pfi9_monitor, "available", False):
+                        pfi9_rate_hz, pfi9_count = pfi9_monitor.read_rate()
+                        if np.isfinite(pfi9_rate_hz):
+                            pfi9_rate_hz_buffer.append(float(pfi9_rate_hz))
+                    if pda.use_external_trigger:
+                        if np.isfinite(pfi9_rate_hz) and pfi9_rate_hz > 0:
+                            trigger_eff = min(1.0, wall_line_rate_hz / pfi9_rate_hz)
+                        elif expected_trigger_hz > 0:
+                            trigger_eff = min(
+                                1.0, wall_line_rate_hz / expected_trigger_hz
+                            )
+                        else:
+                            trigger_eff = 1.0
+                    else:
+                        trigger_eff = 1.0
+
+                    if (
+                        expected_trigger_hz > 0
+                        and np.isfinite(pfi9_rate_hz)
+                        and pfi9_rate_hz > (1.5 * expected_trigger_hz)
+                        and not pfi9_rate_warned
+                    ):
+                        print(
+                            "Warning: PFI9 edge rate is much higher than expected "
+                            f"({pfi9_rate_hz:.1f} vs {expected_trigger_hz:.1f} Hz). "
+                            "This can cause parity flips and pump-chop cancellation in persistent mode."
+                        )
+                        pfi9_rate_warned = True
+
+                    size_changed = False
+                    if line.size != x.size:
+                        x = np.arange(line.size)
+                        raw_line_plot.set_xdata(x)
+                        integrated_line_plot.set_xdata(x)
+                        if ref_raw_line_plot is not None:
+                            ref_raw_line_plot.set_xdata(x)
+                        if ref_integrated_line_plot is not None:
+                            ref_integrated_line_plot.set_xdata(x)
+                        if diff_raw_line_plot is not None:
+                            diff_raw_line_plot.set_xdata(x)
+                        if diff_integrated_line_plot is not None:
+                            diff_integrated_line_plot.set_xdata(x)
+                        if chop_raw_line_plot is not None:
+                            chop_raw_line_plot.set_xdata(x)
+                        if chop_integrated_line_plot is not None:
+                            chop_integrated_line_plot.set_xdata(x)
+                        ax.set_xlim(0, max(1, line.size - 1))
+                        if ax_demod is not None:
+                            ax_demod.set_xlim(0, max(1, line.size - 1))
+                        if (
+                            pump_chop_dark_offset is not None
+                            and pump_chop_dark_offset.size != line.size
+                        ):
+                            pump_chop_dark_offset = None
+                            _set_pump_dark_status(
+                                f"size mismatch after resize ({line.size})"
+                            )
+                            print(
+                                "Cleared pump-dark offset after sample-count change."
+                            )
+                        size_changed = True
+
+                    reader_queue_depth = float("nan")
+                    reader_queue_max_depth = float("nan")
+                    now_for_plot = time.perf_counter()
+                    should_update_plot = size_changed or (
+                        now_for_plot >= next_plot_update_t
+                    )
+                    if not should_update_plot:
+                        continue
+                    next_plot_update_t = now_for_plot + plot_update_interval_s
+
+                    plot_update_counter += 1
+                    raw_line_plot.set_ydata(line)
+                    integrated_line_plot.set_ydata(integrated_line)
+                    if ref_raw_line_plot is not None and ref_line is not None:
+                        ref_raw_line_plot.set_ydata(ref_line)
+                    if (
+                        ref_integrated_line_plot is not None
+                        and ref_integrated_line is not None
+                    ):
+                        ref_integrated_line_plot.set_ydata(ref_integrated_line)
+                    if diff_raw_line_plot is not None and diff_line is not None:
+                        diff_raw_line_plot.set_ydata(diff_line)
+                    if (
+                        diff_integrated_line_plot is not None
+                        and diff_integrated_line is not None
+                    ):
+                        diff_integrated_line_plot.set_ydata(diff_integrated_line)
+                    if chop_raw_line_plot is not None and latest_chop_pair is not None:
+                        chop_raw_line_plot.set_ydata(latest_chop_pair)
+                    latest_chop_integrated_display = _apply_pump_dark_offset(
+                        latest_chop_integrated
+                    )
+                    if (
+                        chop_integrated_line_plot is not None
+                        and latest_chop_integrated_display is not None
+                    ):
+                        chop_integrated_line_plot.set_ydata(
+                            latest_chop_integrated_display
+                        )
+
+                    ax.set_title(
+                        "CMOS Video (Simple Mode) "
+                        f"| mode={mode_key} "
+                        f"| st_delay={pda.st_initial_delay * 1e6:.1f} us "
+                        f"| clk_delay={pda.clk_initial_delay * 1e6:.1f} us "
+                        f"| integrated N={line_buffer_len} "
+                        f"| svc={read_service_rate_hz:.1f} Hz "
+                        f"| wall={wall_line_rate_hz:.1f} Hz "
+                        f"| eff={100.0 * trigger_eff:.1f}%"
+                        + (
+                            f" | q~{pending_lines:.1f} lines"
+                            if session is not None and np.isfinite(pending_lines)
+                            else ""
+                        )
+                        + (
+                            f" | pfi9~{pfi9_rate_hz:.1f} Hz"
+                            if np.isfinite(pfi9_rate_hz)
+                            else ""
+                        )
+                        + (
+                            f" | chop_pairs={chop_pair_counter}"
+                            if pump_chop_demod
+                            else ""
+                        )
+                        + (
+                            f" | hit={capture_hit_rate_pct:.1f}%"
+                            if capture_hit_rate_enable and np.isfinite(capture_hit_rate_pct)
+                            else ""
+                        )
+                    )
+                    if ax_demod is not None:
+                        ax_demod.set_title(_format_demod_title())
+                    if plot_update_counter == 1 or (
+                        plot_update_counter % timing_text_update_every_n_lines == 0
+                    ):
+                        d = pda.get_timing_diagnostics(
+                            trigger_frequency_hz=expected_trigger_hz
+                        )
+                        if pfi9_monitor is None:
+                            pfi9_status_line = "PFI9 monitor: disabled"
+                        elif getattr(pfi9_monitor, "available", False):
+                            pfi9_status_line = (
+                                "PFI9 monitor: active "
+                                f"({pfi9_monitor.counter}, gate={pfi9_monitor.rate_gate_s * 1e3:.1f} ms)"
+                            )
+                        else:
+                            pfi9_err = str(getattr(pfi9_monitor, "error_text", "")).strip()
+                            if len(pfi9_err) > 90:
+                                pfi9_err = pfi9_err[:87] + "..."
+                            pfi9_status_line = (
+                                "PFI9 monitor: unavailable"
+                                + (f" ({pfi9_err})" if pfi9_err else "")
+                            )
+                        pfi9_med = (
+                            float(np.median(pfi9_rate_hz_buffer))
+                            if pfi9_rate_hz_buffer
+                            else float("nan")
+                        )
+                        queue_med = (
+                            float(np.median(pending_lines_buffer))
+                            if (session is not None and pending_lines_buffer)
+                            else float("nan")
+                        )
+                        timing_lines = [
+                            f"Mode={mode_badge_label} Video={mode_key} N={line_buffer_len}",
+                            (
+                                f"Svc/Wall={read_service_rate_hz:.1f}/"
+                                f"{wall_line_rate_hz:.1f} Hz  "
+                                f"Eff={100.0 * trigger_eff:.1f}%"
+                            ),
+                            pfi9_status_line,
+                            f"AUC main={integrated_auc_main:.6g} V*s",
+                        ]
+                        if np.isfinite(integrated_auc_ref):
+                            timing_lines.append(
+                                f"AUC ref/diff={integrated_auc_ref:.6g}/"
+                                f"{integrated_auc_diff:.6g} V*s"
+                            )
+                        timing_lines.append(
+                            (
+                                f"ST rise/fall={d['st_rise_s'] * 1e6:.1f}/"
+                                f"{d['st_fall_s'] * 1e6:.1f} us  "
+                                f"CLK start={d['clk_start_s'] * 1e6:.1f} us"
+                            )
+                        )
+                        margin_us = (
+                            d["timing_margin_s"] * 1e6
+                            if d["timing_margin_s"] is not None
+                            else float("nan")
+                        )
+                        timing_lines.append(
+                            (
+                                f"AI start={d['ai_start_event_s'] * 1e6:.1f} us  "
+                                f"Read={d['samples_per_line_read']}  "
+                                f"Margin={margin_us:.1f} us"
+                            )
+                        )
+                        if np.isfinite(pfi9_med):
+                            pfi9_line = f"PFI9 med={pfi9_med:.1f} Hz"
+                            if expected_trigger_hz > 0:
+                                pfi9_line += f" ({pfi9_med / expected_trigger_hz:.2f}x)"
+                            timing_lines.append(pfi9_line)
+                        if np.isfinite(queue_med):
+                            timing_lines.append(
+                                f"AI queue med/max={queue_med:.1f}/{max_pending_lines:.1f}"
+                            )
+                        if (
+                            trigger_budget_margin_s is not None
+                            and trigger_budget_limited_s is not None
+                        ):
+                            timing_lines.append(
+                                f"Budget margin={trigger_budget_margin_s * 1e6:.1f} us"
+                            )
+                        if capture_hit_rate_enable:
+                            if np.isfinite(capture_hit_rate_pct):
+                                timing_lines.append(
+                                    f"Hit={capture_hit_rate_pct:.1f}%  "
+                                    f"Vpp={capture_last_score_vpp:.4g}/"
+                                    f"{capture_last_threshold_vpp:.4g}"
+                                )
+                            else:
+                                timing_lines.append(
+                                    f"Hit warmup {capture_warmup_count}/"
+                                    f"{capture_hit_warmup_lines}"
+                                )
+                        if pump_chop_demod:
+                            chop_line = f"Chop {demod_mode_label}"
+                            if pump_chop_use_adjacent_pairs:
+                                chop_line += f" pairs={pair_buffer_len}"
+                                if pump_chop_sign_agnostic_preview:
+                                    chop_line += f" flips={chop_preview_flip_counter}"
+                            else:
+                                chop_line += (
+                                    f" ph0/ph1={phase0_buffer_len}/"
+                                    f"{phase1_buffer_len}"
+                                )
+                            chop_line += f" resets={chop_parity_reset_counter}"
+                            timing_lines.append(chop_line)
+                            timing_lines.append(f"Dark={pump_chop_dark_status}")
+                            if latest_chop_integrated_display is not None:
+                                chop_rms = float(
+                                    np.std(latest_chop_integrated_display)
+                                )
+                                chop_pp = float(
+                                    np.ptp(latest_chop_integrated_display)
+                                )
+                                timing_lines.append(
+                                    f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} V"
+                                )
+                        timing_text.set_text("\n".join(timing_lines))
+
+                    if ax_trig is not None and trig_rate_plot is not None and pfi9_rate_hz_buffer:
+                        trig_arr = np.asarray(pfi9_rate_hz_buffer, dtype=float)
+                        trig_rate_plot.set_xdata(np.arange(trig_arr.size))
+                        trig_rate_plot.set_ydata(trig_arr)
+                        ax_trig.set_xlim(0, max(1, trig_arr.size - 1))
+
+                    if plot_update_counter % autoscale_every_n_plot_updates == 0:
+                        ax.relim(visible_only=True)
+                        ax.autoscale_view(scalex=False, scaley=True)
+                        if ax_demod is not None:
+                            ax_demod.relim(visible_only=True)
+                            ax_demod.autoscale_view(scalex=False, scaley=True)
+                        if (
+                            ax_trig is not None
+                            and trig_rate_plot is not None
+                            and pfi9_rate_hz_buffer
+                        ):
+                            ax_trig.relim(visible_only=True)
+                            ax_trig.autoscale_view(scalex=False, scaley=True)
+                    fig.canvas.draw_idle()
+                    plt.pause(0.001)
+                    continue
+
                 data = None
                 lines_consumed = 1
                 acq_elapsed_s = 0.0
                 try:
                     if reader is not None:
-                        packet, reader_exc = reader.snapshot()
+                        packet, reader_exc, queue_depth_now, queue_depth_max = reader.pop_next(
+                            wait_timeout_s=0.0
+                        )
+                        reader_queue_depth = float(queue_depth_now)
+                        reader_queue_max_depth = float(queue_depth_max)
                         if reader_exc is not None:
                             raise reader_exc
-                        if packet is None or int(packet["seq"]) <= int(reader_seq_last):
+                        if packet is None:
                             if (
                                 pfi9_monitor is not None
                                 and getattr(pfi9_monitor, "available", False)
@@ -2151,14 +3574,9 @@ def run_live_plot(
                             plt.pause(0.001)
                             continue
 
-                        reader_seq_last = int(packet["seq"])
                         data = packet["data"]
-                        lines_total = int(packet["lines_total"])
-                        acq_total_s = float(packet["acq_total_s"])
-                        lines_consumed = max(1, lines_total - reader_lines_total_last)
-                        acq_elapsed_s = max(1e-9, acq_total_s - reader_acq_total_last_s)
-                        reader_lines_total_last = lines_total
-                        reader_acq_total_last_s = acq_total_s
+                        lines_consumed = 1
+                        acq_elapsed_s = max(1e-9, float(packet["elapsed_s"]))
                     else:
                         acq_start = time.perf_counter()
                         if session is None:
@@ -2278,6 +3696,10 @@ def run_live_plot(
                 else:
                     trigger_eff = 1.0
 
+                if reader is None:
+                    reader_queue_depth = float("nan")
+                    reader_queue_max_depth = float("nan")
+
                 if (
                     expected_trigger_hz > 0
                     and np.isfinite(pfi9_rate_hz)
@@ -2325,9 +3747,11 @@ def run_live_plot(
                     chop_pair_buffer.clear()
                     chop_pair_sum = np.zeros_like(x, dtype=float)
                     chop_pair_counter = 0
+                    chop_preview_flip_counter = 0
                     chop_parity_reset_counter = 0
                     latest_chop_pair = None
                     latest_chop_integrated = None
+                    chop_preview_template = None
                     chop_prev_phase = None
                     demod_last_line_phase = None
                     capture_score_recent.clear()
@@ -2338,6 +3762,17 @@ def run_live_plot(
                     integrated_auc_main = float("nan")
                     integrated_auc_ref = float("nan")
                     integrated_auc_diff = float("nan")
+                    if (
+                        pump_chop_dark_offset is not None
+                        and pump_chop_dark_offset.size != line.size
+                    ):
+                        pump_chop_dark_offset = None
+                        _set_pump_dark_status(
+                            f"size mismatch after resize ({line.size})"
+                        )
+                        print(
+                            "Cleared pump-dark offset after sample-count change."
+                        )
                     parity_reset_requested = True
                     parity_reset_reason = "line size changed"
                     size_changed = True
@@ -2492,6 +3927,7 @@ def run_live_plot(
                         chop_pair_sum = np.zeros_like(x, dtype=float)
                         latest_chop_pair = None
                         latest_chop_integrated = None
+                        chop_preview_template = None
                         chop_parity_reset_counter += 1
                         if not chop_parity_warned:
                             print(
@@ -2505,27 +3941,23 @@ def run_live_plot(
                         # rejected lines into chop demod accumulators.
                         pass
                     elif pump_chop_use_adjacent_pairs:
-                        if demod_qual_active:
-                            current_phase = int(
-                                0 if demod_line_phase is None else demod_line_phase
-                            )
-                        else:
-                            current_phase = int(
-                                chop_phase ^ ((lines_consumed - 1) & 1)
-                            )
-                            chop_phase = int(chop_phase ^ (lines_consumed & 1))
-                        if chop_prev_line is None:
-                            chop_prev_line = line.copy()
-                            chop_prev_phase = current_phase
-                            latest_chop_pair = None
-                            latest_chop_integrated = None
-                        else:
-                            make_pair = (
-                                (chop_prev_phase is None)
-                                or (current_phase != chop_prev_phase)
-                            )
-                            if make_pair:
+                        if pump_chop_sign_agnostic_preview:
+                            if chop_prev_line is None:
+                                chop_prev_line = line.copy()
+                                latest_chop_pair = None
+                                latest_chop_integrated = None
+                            else:
                                 chop_pair = pump_chop_sign * (line - chop_prev_line)
+                                if (
+                                    chop_preview_template is not None
+                                    and np.any(np.isfinite(chop_preview_template))
+                                ):
+                                    template_dot = float(
+                                        np.dot(chop_pair, chop_preview_template)
+                                    )
+                                    if template_dot < 0.0:
+                                        chop_pair = -chop_pair
+                                        chop_preview_flip_counter += 1
                                 chop_pair_counter += 1
                                 latest_chop_pair = chop_pair
                                 if len(chop_pair_buffer) == chop_pair_buffer.maxlen:
@@ -2535,10 +3967,43 @@ def run_live_plot(
                                 latest_chop_integrated = chop_pair_sum / float(
                                     len(chop_pair_buffer)
                                 )
+                                chop_preview_template = latest_chop_integrated.copy()
+                                chop_prev_line = line.copy()
+                        else:
+                            if demod_qual_active:
+                                current_phase = int(
+                                    0 if demod_line_phase is None else demod_line_phase
+                                )
                             else:
+                                current_phase = int(
+                                    chop_phase ^ ((lines_consumed - 1) & 1)
+                                )
+                                chop_phase = int(chop_phase ^ (lines_consumed & 1))
+                            if chop_prev_line is None:
+                                chop_prev_line = line.copy()
+                                chop_prev_phase = current_phase
                                 latest_chop_pair = None
-                            chop_prev_line = line.copy()
-                            chop_prev_phase = current_phase
+                                latest_chop_integrated = None
+                            else:
+                                make_pair = (
+                                    (chop_prev_phase is None)
+                                    or (current_phase != chop_prev_phase)
+                                )
+                                if make_pair:
+                                    chop_pair = pump_chop_sign * (line - chop_prev_line)
+                                    chop_pair_counter += 1
+                                    latest_chop_pair = chop_pair
+                                    if len(chop_pair_buffer) == chop_pair_buffer.maxlen:
+                                        chop_pair_sum -= chop_pair_buffer.popleft()
+                                    chop_pair_buffer.append(chop_pair.copy())
+                                    chop_pair_sum += chop_pair
+                                    latest_chop_integrated = chop_pair_sum / float(
+                                        len(chop_pair_buffer)
+                                    )
+                                else:
+                                    latest_chop_pair = None
+                                chop_prev_line = line.copy()
+                                chop_prev_phase = current_phase
                     else:
                         if demod_qual_active:
                             current_phase = int(
@@ -2618,11 +4083,16 @@ def run_live_plot(
                     diff_integrated_line_plot.set_ydata(diff_integrated_line)
                 if chop_raw_line_plot is not None and latest_chop_pair is not None:
                     chop_raw_line_plot.set_ydata(latest_chop_pair)
+                latest_chop_integrated_display = _apply_pump_dark_offset(
+                    latest_chop_integrated
+                )
                 if (
                     chop_integrated_line_plot is not None
-                    and latest_chop_integrated is not None
+                    and latest_chop_integrated_display is not None
                 ):
-                    chop_integrated_line_plot.set_ydata(latest_chop_integrated)
+                    chop_integrated_line_plot.set_ydata(
+                        latest_chop_integrated_display
+                    )
 
                 ax.set_title(
                     "CMOS Video (Simple Mode) "
@@ -2636,6 +4106,11 @@ def run_live_plot(
                     + (
                         f" | q~{pending_lines:.1f} lines"
                         if session is not None and np.isfinite(pending_lines)
+                        else ""
+                    )
+                    + (
+                        f" | fifo~{reader_queue_depth:.0f}/{reader_queue_max_depth:.0f}"
+                        if reader is not None and np.isfinite(reader_queue_depth)
                         else ""
                     )
                     + (
@@ -2654,6 +4129,8 @@ def run_live_plot(
                         else ""
                     )
                 )
+                if ax_demod is not None:
+                    ax_demod.set_title(_format_demod_title())
                 if line_counter == 1 or (
                     line_counter % timing_text_update_every_n_lines == 0
                 ):
@@ -2728,7 +4205,11 @@ def run_live_plot(
                         timing_lines.append(pfi9_line)
                     if np.isfinite(queue_med):
                         timing_lines.append(
-                            f"Queue med/max={queue_med:.1f}/{max_pending_lines:.1f}"
+                            f"AI queue med/max={queue_med:.1f}/{max_pending_lines:.1f}"
+                        )
+                    if reader is not None and np.isfinite(reader_queue_depth):
+                        timing_lines.append(
+                            f"Reader FIFO now/max={reader_queue_depth:.0f}/{reader_queue_max_depth:.0f}"
                         )
                     if use_fast_session and retrigger_latest_only_read:
                         timing_lines.append(
@@ -2758,6 +4239,8 @@ def run_live_plot(
                         chop_line = f"Chop {demod_mode_label}"
                         if pump_chop_use_adjacent_pairs:
                             chop_line += f" pairs={len(chop_pair_buffer)}"
+                            if pump_chop_sign_agnostic_preview:
+                                chop_line += f" flips={chop_preview_flip_counter}"
                         else:
                             chop_line += (
                                 f" ph0/ph1={len(chop_phase0_buffer)}/"
@@ -2765,9 +4248,10 @@ def run_live_plot(
                             )
                         chop_line += f" resets={chop_parity_reset_counter}"
                         timing_lines.append(chop_line)
-                        if latest_chop_integrated is not None:
-                            chop_rms = float(np.std(latest_chop_integrated))
-                            chop_pp = float(np.ptp(latest_chop_integrated))
+                        timing_lines.append(f"Dark={pump_chop_dark_status}")
+                        if latest_chop_integrated_display is not None:
+                            chop_rms = float(np.std(latest_chop_integrated_display))
+                            chop_pp = float(np.ptp(latest_chop_integrated_display))
                             timing_lines.append(
                                 f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} V"
                             )
@@ -2794,6 +4278,11 @@ def run_live_plot(
     except KeyboardInterrupt:
         print("\nStopped continuous acquisition.")
     finally:
+        if processor is not None:
+            try:
+                processor.close()
+            except Exception:
+                pass
         if reader is not None:
             try:
                 reader.close()
@@ -2804,10 +4293,9 @@ def run_live_plot(
         plt.show()
 
 
-if __name__ == "__main__":
-    cli = argparse.ArgumentParser(
-        description="Simple live PDA/CMOS DAQ runner."
-    )
+def _build_cli_parser():
+    """Build command-line parser for live and sweep operations."""
+    cli = argparse.ArgumentParser(description="Simple live PDA/CMOS DAQ runner.")
     cli.add_argument(
         "--operation",
         default="live",
@@ -2819,6 +4307,25 @@ if __name__ == "__main__":
         default=PDAControllerDAQSimple.DEFAULT_TIMING_PROFILE,
         choices=sorted(PDAControllerDAQSimple.TIMING_PROFILES.keys()),
         help="Select named timing profile.",
+    )
+    cli.add_argument(
+        "--runtime-profile",
+        default=RUNTIME_PROFILE_DEFAULT,
+        choices=RUNTIME_PROFILE_CHOICES,
+        help=(
+            "Acquisition runtime profile. "
+            "'persistent_robust_test' is the default retriggered mode."
+        ),
+    )
+    cli.add_argument(
+        "--preset",
+        default=LIVE_PRESET_DEFAULT,
+        choices=LIVE_PRESET_CHOICES,
+        help=(
+            "Quick UX preset. "
+            "'signal_only' disables pump-chop demod; "
+            "'trigger_debug' emphasizes trigger diagnostics."
+        ),
     )
     cli.add_argument(
         "--list-timing-profiles",
@@ -2848,6 +4355,15 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Autoscale every N plot updates (default from runtime profile).",
+    )
+    cli.add_argument(
+        "--reader-fifo-packets",
+        type=int,
+        default=None,
+        help=(
+            "Max packets buffered in the decoupled retrigger FIFO reader "
+            "(default from runtime profile)."
+        ),
     )
     cli.add_argument(
         "--sweep-evaluation-seconds",
@@ -2914,6 +4430,97 @@ if __name__ == "__main__":
         action="store_true",
         help="After sweep, continue into live plot with best settings.",
     )
+    return cli
+
+
+def _resolve_runtime_profile_settings(profile_name):
+    """
+    Return acquisition/runtime defaults for the selected runtime profile.
+
+    The returned mapping includes DAQ session mode, read mode, and live-plot
+    cadence defaults.
+    """
+    profile = str(profile_name).strip().lower()
+    if profile == RUNTIME_PROFILE_PERSISTENT_LATEST:
+        return {
+            "use_persistent_session": True,
+            "retrigger_latest_only_read": True,
+            "retrigger_overwrite_unread": True,
+            "decouple_acquisition_from_plot": True,
+            "reader_fifo_max_packets": 64,
+            "demod_trigger_qualified_acceptance": False,
+            "plot_update_every_n_lines": 25,
+            "plot_target_fps": 10.0,
+            "timing_text_update_every_n_lines": 200,
+            "autoscale_every_n_plot_updates": 12,
+            "persistent_ai_buffer_lines": 256,
+        }
+    if profile == RUNTIME_PROFILE_PERSISTENT_ROBUST:
+        return {
+            "use_persistent_session": True,
+            "retrigger_latest_only_read": False,
+            "retrigger_overwrite_unread": False,
+            "decouple_acquisition_from_plot": True,
+            "reader_fifo_max_packets": 256,
+            "demod_trigger_qualified_acceptance": False,
+            "plot_update_every_n_lines": 2,
+            "plot_target_fps": 25.0,
+            "timing_text_update_every_n_lines": 40,
+            "autoscale_every_n_plot_updates": 8,
+            "persistent_ai_buffer_lines": 256,
+        }
+    if profile == RUNTIME_PROFILE_SAFE:
+        return {
+            "use_persistent_session": False,
+            "retrigger_latest_only_read": False,
+            "retrigger_overwrite_unread": False,
+            "decouple_acquisition_from_plot": False,
+            "reader_fifo_max_packets": 64,
+            "demod_trigger_qualified_acceptance": True,
+            "plot_update_every_n_lines": 1,
+            "plot_target_fps": 15.0,
+            "timing_text_update_every_n_lines": 100,
+            "autoscale_every_n_plot_updates": 8,
+            "persistent_ai_buffer_lines": 256,
+        }
+    raise ValueError(
+        "Unknown acquisition runtime profile. "
+        f"Use one of: {', '.join(RUNTIME_PROFILE_CHOICES)}"
+    )
+
+
+def _apply_live_preset(live_cfg, preset_name):
+    """
+    Apply a lightweight usage preset to live configuration.
+
+    Presets intentionally only touch a small subset of user-facing options.
+    """
+    preset = str(preset_name).strip().lower()
+    if preset in ("", LIVE_PRESET_DEFAULT):
+        return
+    if preset == LIVE_PRESET_SIGNAL_ONLY:
+        # Simplest viewing mode: raw/integrated main line only.
+        live_cfg["live_video_mode"] = "main"
+        live_cfg["pump_chop_demod"] = False
+        live_cfg["plot_raw_line"] = True
+        return
+    if preset == LIVE_PRESET_TRIGGER_DEBUG:
+        # Emphasize trigger diagnostics while keeping acquisition unchanged.
+        live_cfg["pump_chop_demod"] = False
+        live_cfg["plot_raw_line"] = True
+        live_cfg["timing_text_update_every_n_lines"] = min(
+            int(live_cfg["timing_text_update_every_n_lines"]), 20
+        )
+        live_cfg["trigger_plot_history"] = max(int(live_cfg["trigger_plot_history"]), 1200)
+        return
+    raise ValueError(
+        f"Unknown live preset '{preset_name}'. Use one of: {', '.join(LIVE_PRESET_CHOICES)}"
+    )
+
+
+def main():
+    """Entry point for live run and sweep workflows."""
+    cli = _build_cli_parser()
     cli_args = cli.parse_args()
     if cli_args.list_timing_profiles:
         print("Available timing profiles:")
@@ -2923,14 +4530,11 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     # -----------------------------
-    # Simple runtime config
+    # Controller and trigger setup
     # -----------------------------
     pda = PDAControllerDAQSimple(device="Dev1", num_pixels=1024)
-
-    # Toggle this to compare free-run vs external trigger gated operation.
     pda.enable_external_trigger(True)
-    # External trigger digital filtering (helps reject PFI9 glitches/ringing).
-    # Start disabled. If needed, enable with a small width such as 0.1-0.5 us.
+
     trigger_filter_enable = False
     trigger_filter_min_pulse_width_s = 0.2e-6
     trigger_sync_enable = True
@@ -2939,145 +4543,95 @@ if __name__ == "__main__":
         min_pulse_width_s=trigger_filter_min_pulse_width_s,
     )
     pda.set_trigger_sync(trigger_sync_enable)
-    # Critical for retriggered counter timing: re-apply initial_delay on every
-    # retriggered pulse train, not just the first trigger.
     pda.set_retrigger_initial_delay(True)
-
-    # Video timing control:
-    # - start_on_st_fall=True: begin sampling at first CLK rising edge after ST low.
-    # - dummy_clocks=14: retain 14 pre-pixel clocks before the 1024 valid pixels.
-    # This sets total acquired clocks to 14 + 1024 = 1038.
-    video_dummy_clocks = 14
-    video_start_on_st_fall = True
-    pda.set_video_timing(
-        dummy_clocks=video_dummy_clocks,
-        pixel_clocks=pda.num_pixels,
-        start_on_st_fall=video_start_on_st_fall,
+    pda.set_chopper_sync_output(
+        enable=True,
+        out_pfi="PFI3",
+        source_terminal=pda.trig_in,
+        initial_delay_ticks=0,
+        high_ticks=2,
+        low_ticks=2,
     )
-    # Keep uncropped output so timing/debug view shows the dummy-clock region.
+
+    # Video timing: sample from first CLK edge after ST falls and keep 14 clocks
+    # of pre-pixel region visible for timing diagnostics.
+    pda.set_video_timing(
+        dummy_clocks=14,
+        pixel_clocks=pda.num_pixels,
+        start_on_st_fall=True,
+    )
     pda.set_output_cropping(False)
 
-    # Live plot settings
-    # Timing profile (can also be passed from CLI via --timing-profile).
-    # Available: main_1khz_safe, txt_1khz_rebased, initial_guess, improved_guess,
-    #            improved_guess_2channel, toofast_guess
     timing_profile_name = cli_args.timing_profile
     pda.apply_timing_profile(timing_profile_name)
     print(f"Timing profile: {timing_profile_name}")
-    # Deterministic phase shift from trigger edge to ST rise (shifts ST+CLK together).
-    # Default phase shift.
     trigger_to_st_phase_shift_us = 0.0
     pda.set_trigger_phase_shift(trigger_to_st_phase_shift_us * 1e-6)
     print(f"Trigger->ST phase shift: {trigger_to_st_phase_shift_us:.1f} us")
 
-    integration_line_count = 128
-    plot_raw_line = True
-    # "main", "ref", or "both"
-    live_video_mode = "main"
-    # Alternating-line demod for 500 Hz pump chopper on a 1000 Hz trigger.
-    pump_chop_demod = True
-    # If the sign is inverted, set to -1.0.
-    pump_chop_sign = 1.0
-    # Troubleshooting toggle:
-    # False -> robust phase-bucket demod (phase1-phase0),
-    # True  -> original adjacent odd-even pair demod (line[n]-line[n-1]).
-    pump_chop_use_adjacent_pairs = True
-    # In safe mode, only accept demod lines with exactly one PFI9 edge between
-    # consecutive accepted reads. Helps avoid parity poisoning from missed/extra
-    # trigger edges.
-    demod_trigger_qualified_acceptance = True
     expected_trigger_hz = 1000.0
     acquisition_timeout_s = 50.0
-    persistent_ai_buffer_lines = 256
-    # Runtime profile:
-    # - "persistent_latest_test": arm once, read latest line, drop backlog.
-    # - "persistent_robust_test": arm once, decoupled sequential reads, no overwrite.
-    # - "safe": rebuild/start tasks per line.
-    acquisition_runtime_profile = "persistent_robust_test"
-    # Stable retriggered architecture:
-    # 1) optionally log all acquired lines to TDMS (LOG_AND_READ),
-    # 2) live plot reads latest complete line only, so GUI lag does not
-    #    chase backlog.
-    tdms_log_enable = False
-    tdms_log_dir = Path(__file__).resolve().parent / "acquisition_results"
-    tdms_log_dir.mkdir(parents=True, exist_ok=True)
-    tdms_file_path = str(
-        tdms_log_dir / f"pda_retrigger_{time.strftime('%Y%m%d_%H%M%S')}.tdms"
-    )
-    tdms_group_name = "PDA"
-    tdms_logging_mode = LoggingMode.LOG_AND_READ
-    tdms_logging_operation = LoggingOperation.OPEN_OR_CREATE
+    acquisition_runtime_profile = str(cli_args.runtime_profile).strip().lower()
+    runtime_settings = _resolve_runtime_profile_settings(acquisition_runtime_profile)
 
-    if acquisition_runtime_profile == "persistent_latest_test":
-        # Persistent retriggered + latest-only read path.
-        use_persistent_session = True
-        retrigger_latest_only_read = True
-        retrigger_overwrite_unread = True
-        decouple_acquisition_from_plot = True
-        # Trigger-qualified acceptance is exact in safe mode only; disable it
-        # here to avoid ambiguity in persistent mode.
-        demod_trigger_qualified_acceptance = False
-        # Conservative UI update pacing so plotting does not dominate runtime.
-        plot_update_every_n_lines = 25
-        plot_target_fps = 10.0
-        timing_text_update_every_n_lines = 200
-        autoscale_every_n_plot_updates = 12
-        persistent_ai_buffer_lines = 256
-    elif acquisition_runtime_profile == "persistent_robust_test":
-        # Persistent retriggered + decoupled acquisition, but keep line integrity:
-        # - read sequentially (no latest-only slicing)
-        # - never overwrite unread samples (fallback to safe on overflow)
-        use_persistent_session = True
-        retrigger_latest_only_read = False
-        retrigger_overwrite_unread = False
-        decouple_acquisition_from_plot = True
-        demod_trigger_qualified_acceptance = False
-        # Default live cadence tuned for responsive plotting.
-        plot_update_every_n_lines = 2
-        plot_target_fps = 25.0
-        timing_text_update_every_n_lines = 40
-        autoscale_every_n_plot_updates = 8
-        persistent_ai_buffer_lines = 256
-    elif acquisition_runtime_profile == "safe":
-        # Per-line task build/start.
-        use_persistent_session = False
-        retrigger_latest_only_read = False
-        retrigger_overwrite_unread = False
-        decouple_acquisition_from_plot = False
-        demod_trigger_qualified_acceptance = True
-        plot_update_every_n_lines = 1
-        plot_target_fps = 15.0
-        timing_text_update_every_n_lines = 100
-        autoscale_every_n_plot_updates = 8
-        persistent_ai_buffer_lines = 256
-    else:
-        raise ValueError(
-            "Unknown acquisition_runtime_profile. "
-            "Use 'persistent_latest_test', 'persistent_robust_test', or 'safe'."
-        )
+    # Consolidated live-run configuration. Keeping this in one mapping makes it
+    # easier to reason about active behavior and pass through to run_live_plot().
+    live_cfg = {
+        "integration_line_count": 128,
+        "plot_raw_line": True,
+        "live_video_mode": "main",
+        "pump_chop_demod": True,
+        "pump_chop_sign": -1.0,
+        # Default to the simplest ABAB assumption: odd/even accepted-line buckets.
+        "pump_chop_use_adjacent_pairs": False,
+        "pump_chop_sign_agnostic_preview": False,
+        "expected_trigger_hz": expected_trigger_hz,
+        "acquisition_timeout_s": acquisition_timeout_s,
+        "monitor_pfi9": True,
+        "pfi9_monitor_counter": "ctr2",
+        "pfi9_rate_gate_s": 0.002,
+        "trigger_plot_history": 1200,
+        "capture_hit_rate_enable": True,
+        "capture_hit_rate_window_lines": 256,
+        "capture_hit_threshold_fraction": 0.45,
+        "capture_hit_warmup_lines": 64,
+        "tdms_log_enable": False,
+        "tdms_group_name": "PDA",
+        "tdms_logging_mode": LoggingMode.LOG_AND_READ,
+        "tdms_logging_operation": LoggingOperation.OPEN_OR_CREATE,
+    }
+    live_cfg.update(runtime_settings)
+
+    # Apply optional lightweight UX preset.
+    _apply_live_preset(live_cfg, cli_args.preset)
 
     # Optional live plotting cadence overrides.
     if cli_args.plot_fps is not None:
-        plot_target_fps = max(1.0, float(cli_args.plot_fps))
+        live_cfg["plot_target_fps"] = max(1.0, float(cli_args.plot_fps))
     if cli_args.plot_every_lines is not None:
-        plot_update_every_n_lines = max(1, int(cli_args.plot_every_lines))
+        live_cfg["plot_update_every_n_lines"] = max(1, int(cli_args.plot_every_lines))
     if cli_args.timing_text_every_lines is not None:
-        timing_text_update_every_n_lines = max(1, int(cli_args.timing_text_every_lines))
+        live_cfg["timing_text_update_every_n_lines"] = max(
+            1, int(cli_args.timing_text_every_lines)
+        )
     if cli_args.autoscale_every_updates is not None:
-        autoscale_every_n_plot_updates = max(1, int(cli_args.autoscale_every_updates))
+        live_cfg["autoscale_every_n_plot_updates"] = max(
+            1, int(cli_args.autoscale_every_updates)
+        )
+    if cli_args.reader_fifo_packets is not None:
+        live_cfg["reader_fifo_max_packets"] = max(
+            8, int(cli_args.reader_fifo_packets)
+        )
 
-    monitor_pfi9 = True
-    pfi9_monitor_counter = "ctr2"
-    # Robust trigger-rate estimate gate. Larger gate = smoother/slower response.
-    pfi9_rate_gate_s = 0.002
-    trigger_plot_history = 1200
-    # Lightweight capture hit-rate diagnostic:
-    # score = Vpp(main line), threshold adapts from recent score distribution.
-    capture_hit_rate_enable = True
-    capture_hit_rate_window_lines = 256
-    capture_hit_threshold_fraction = 0.45
-    capture_hit_warmup_lines = 64
+    tdms_log_dir = Path(__file__).resolve().parent / "acquisition_results"
+    tdms_log_dir.mkdir(parents=True, exist_ok=True)
+    live_cfg["tdms_file_path"] = str(
+        tdms_log_dir / f"pda_retrigger_{time.strftime('%Y%m%d_%H%M%S')}.tdms"
+    )
 
+    # -----------------------------
+    # Optional sweep path
+    # -----------------------------
     if cli_args.operation == "sweep":
         print("\n=== Persistent Sweep Mode ===")
         print(
@@ -3085,23 +4639,27 @@ if __name__ == "__main__":
             "external trigger on, main-only, demod off, "
             "latest_only=False, overwrite_unread=False."
         )
-        live_video_mode = "main"
-        pump_chop_demod = False
-        demod_trigger_qualified_acceptance = False
-        use_persistent_session = True
-        retrigger_latest_only_read = False
-        retrigger_overwrite_unread = False
-        decouple_acquisition_from_plot = True
-        tdms_log_enable = False
+        live_cfg.update(
+            {
+                "live_video_mode": "main",
+                "pump_chop_demod": False,
+                "demod_trigger_qualified_acceptance": False,
+                "use_persistent_session": True,
+                "retrigger_latest_only_read": False,
+                "retrigger_overwrite_unread": False,
+                "decouple_acquisition_from_plot": True,
+                "tdms_log_enable": False,
+            }
+        )
 
         run_persistent_timing_sweep(
             pda=pda,
-            expected_trigger_hz=expected_trigger_hz,
+            expected_trigger_hz=live_cfg["expected_trigger_hz"],
             evaluation_seconds=cli_args.sweep_evaluation_seconds,
-            acquisition_timeout_s=acquisition_timeout_s,
-            monitor_pfi9=monitor_pfi9,
-            pfi9_monitor_counter=pfi9_monitor_counter,
-            pfi9_rate_gate_s=pfi9_rate_gate_s,
+            acquisition_timeout_s=live_cfg["acquisition_timeout_s"],
+            monitor_pfi9=live_cfg["monitor_pfi9"],
+            pfi9_monitor_counter=live_cfg["pfi9_monitor_counter"],
+            pfi9_rate_gate_s=live_cfg["pfi9_rate_gate_s"],
             phase_coarse_start_us=cli_args.sweep_phase_coarse_start_us,
             phase_coarse_stop_us=cli_args.sweep_phase_coarse_stop_us,
             phase_coarse_step_us=cli_args.sweep_phase_coarse_step_us,
@@ -3116,37 +4674,8 @@ if __name__ == "__main__":
             raise SystemExit(0)
         print("\nSweep finished. Entering live mode with best settings...\n")
 
-    run_live_plot(
-        pda=pda,
-        integration_line_count=integration_line_count,
-        plot_raw_line=plot_raw_line,
-        live_video_mode=live_video_mode,
-        pump_chop_demod=pump_chop_demod,
-        pump_chop_sign=pump_chop_sign,
-        pump_chop_use_adjacent_pairs=pump_chop_use_adjacent_pairs,
-        demod_trigger_qualified_acceptance=demod_trigger_qualified_acceptance,
-        expected_trigger_hz=expected_trigger_hz,
-        acquisition_timeout_s=acquisition_timeout_s,
-        use_persistent_session=use_persistent_session,
-        plot_update_every_n_lines=plot_update_every_n_lines,
-        plot_target_fps=plot_target_fps,
-        timing_text_update_every_n_lines=timing_text_update_every_n_lines,
-        autoscale_every_n_plot_updates=autoscale_every_n_plot_updates,
-        monitor_pfi9=monitor_pfi9,
-        pfi9_monitor_counter=pfi9_monitor_counter,
-        pfi9_rate_gate_s=pfi9_rate_gate_s,
-        trigger_plot_history=trigger_plot_history,
-        retrigger_latest_only_read=retrigger_latest_only_read,
-        retrigger_overwrite_unread=retrigger_overwrite_unread,
-        tdms_log_enable=tdms_log_enable,
-        tdms_file_path=tdms_file_path,
-        tdms_group_name=tdms_group_name,
-        tdms_logging_mode=tdms_logging_mode,
-        tdms_logging_operation=tdms_logging_operation,
-        decouple_acquisition_from_plot=decouple_acquisition_from_plot,
-        persistent_ai_buffer_lines=persistent_ai_buffer_lines,
-        capture_hit_rate_enable=capture_hit_rate_enable,
-        capture_hit_rate_window_lines=capture_hit_rate_window_lines,
-        capture_hit_threshold_fraction=capture_hit_threshold_fraction,
-        capture_hit_warmup_lines=capture_hit_warmup_lines,
-    )
+    run_live_plot(pda=pda, **live_cfg)
+
+
+if __name__ == "__main__":
+    main()

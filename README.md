@@ -5,6 +5,7 @@ Tools for pump-probe laser spectroscopy experiments controlled by Python.
 ## What Is Included
 
 - `DAQ_pda_simple.py`: stand-alone NI-DAQmx control and live plotting script for CMOS/PDA-style line acquisition.
+- `DAQ_pda_hard.py`: hardware-timed/retrigger-focused CMOS/PDA runner with persistent session mode, timing sweep tools, and richer diagnostics.
 - `stepper_control/conex_raster.py`: CONEX-PP raster stage runner (WLG crystal raster).
 - `stepper_control/chopper.py`: Newport 3502 chopper diagnostic/control runner.
 - `stepper_control/xps_stage.py`: XPS-Q stage diagnostic/control runner.
@@ -47,6 +48,29 @@ pip install -r requirements.txt
 
 ```powershell
 python DAQ_pda_simple.py
+```
+
+For the hardware-timed retrigger script:
+
+```powershell
+python DAQ_pda_hard.py
+```
+
+Useful `DAQ_pda_hard.py` options:
+
+```powershell
+# Select runtime mode (default is persistent_robust_test)
+python DAQ_pda_hard.py --runtime-profile persistent_robust_test
+
+# Quick usage presets
+python DAQ_pda_hard.py --preset signal_only
+python DAQ_pda_hard.py --preset trigger_debug
+
+# Tune live plot cadence
+python DAQ_pda_hard.py --plot-fps 25 --plot-every-lines 2 --timing-text-every-lines 40 --autoscale-every-updates 8
+
+# Run persistent timing sweep
+python DAQ_pda_hard.py --operation sweep
 ```
 
 For the stepper raster script:

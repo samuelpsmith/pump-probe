@@ -147,13 +147,21 @@ def _maybe_relaunch_with_python32():
 
 def _build_cli():
     parser = argparse.ArgumentParser(
-        description="Newport 3502 chopper setup/diagnostic runner."
+        description=(
+            "Newport 3502 chopper setup/diagnostic runner. "
+            "Defaults are for 42/30 wheel, EXT+ sync, NORMAL mode, "
+            "and a 500 Hz external sync reference."
+        )
     )
     parser.add_argument(
         "--freq-hz",
         type=float,
         default=500.0,
-        help="Requested chopping frequency in Hz (default: 500).",
+        help=(
+            "Requested frequency in Hz. In INT mode this is the synth frequency. "
+            "In EXT+/EXT- mode this is the expected external sync frequency "
+            "for logging/verification (default: 500)."
+        ),
     )
     parser.add_argument(
         "--wheel",
@@ -170,6 +178,11 @@ def _build_cli():
         default="normal",
         help="Controller mode label or numeric enum (default: normal).",
     )
+    parser.add_argument(
+        "--status-only",
+        action="store_true",
+        help="Query and print current settings without changing the controller.",
+    )
     return parser
 
 
@@ -185,6 +198,13 @@ def _resolve_enum(value, mapping):
     )
 
 
+def _invert_enum_map(mapping):
+    inverse = {}
+    for label, numeric in mapping.items():
+        inverse.setdefault(int(numeric), label)
+    return inverse
+
+
 if __name__ == "__main__":
     args = _build_cli().parse_args()
 
@@ -194,25 +214,43 @@ if __name__ == "__main__":
 
     import Newport_3502_chopper_controller as npc
 
-    # Numeric enums are from Newport 3502 command library usage in this project.
-    # Keep labels human-readable and allow numeric override from CLI for safety.
+    # Numeric enums follow the Newport 3502 command table:
+    # SYN: 0=Vext, 1=EXT+, 2=EXT-, 3=INT
+    # WHL: 0=60, 1=42/30, 2=7/5, 3=2, 4=100
+    # MOD: 0=H/S, 1=+/-, 2=NORMAL
     wheel_map = {
-        "42/30": 4,
-        "4230": 4,
-        "4": 4,
+        "60": 0,
+        "0": 0,
+        "42/30": 1,
+        "4230": 1,
+        "7/5": 2,
+        "75": 2,
+        "2": 3,
+        "2-slot": 3,
+        "100": 4,
     }
     sync_map = {
-        "int": 1,
-        "internal": 1,
-        "ext": 2,
-        "external": 2,
-        "ext+": 3,
-        "external+": 3,
+        "vext": 0,
+        "voltage": 0,
+        "ext+": 1,
+        "external+": 1,
+        "ext": 1,
+        "external": 1,
+        "ext-": 2,
+        "external-": 2,
+        "int": 3,
+        "internal": 3,
     }
     mode_map = {
-        "normal": 0,
-        "0": 0,
+        "h/s": 0,
+        "hs": 0,
+        "+/-": 1,
+        "plusminus": 1,
+        "normal": 2,
     }
+    wheel_names = _invert_enum_map(wheel_map)
+    sync_names = _invert_enum_map(sync_map)
+    mode_names = _invert_enum_map(mode_map)
 
     target_frequency_hz = float(args.freq_hz)
     target_wheel = _resolve_enum(args.wheel, wheel_map)
@@ -222,6 +260,12 @@ if __name__ == "__main__":
     _log("Starting chopper diagnostic runner.")
     _log(f"Python: {sys.version.split()[0]}")
     _log(f"Working directory: {os.getcwd()}")
+    if target_sync in (1, 2):
+        _log(
+            "Configured for external sync mode. Expect a clean TTL reference near "
+            f"{target_frequency_hz:.3f} Hz on the chopper Sync In "
+            "(for this project, from DAQ PFI3)."
+        )
     _log(
         "Requested settings: "
         f"wheel={args.wheel!r} -> {target_wheel}, "
@@ -257,21 +301,60 @@ if __name__ == "__main__":
             _log("Skipping set/get frequency because no valid device key was found.")
             exit_code = 2
         else:
-            _safe_call("Set wheel type", controller.setWheelType, target_wheel)
-            _safe_call("Set sync mode", controller.setSync, target_sync)
-            _safe_call("Set controller mode", controller.setMode, target_mode)
-            _safe_call("Set synth frequency", controller.setSynthFreq, target_frequency_hz)
-            _safe_call("Get wheel type", controller.getWheelType)
+            if args.status_only:
+                _log("Status-only mode: no settings will be changed.")
+            else:
+                _safe_call("Set wheel type", controller.setWheelType, target_wheel)
+                _safe_call("Set sync mode", controller.setSync, target_sync)
+                _safe_call("Set controller mode", controller.setMode, target_mode)
+                if target_sync == 3:
+                    _safe_call(
+                        "Set synth frequency",
+                        controller.setSynthFreq,
+                        target_frequency_hz,
+                    )
+                else:
+                    _log(
+                        "Skipping SetSynthFreq because sync mode is external. "
+                        "In EXT+/EXT- the chopper should lock to the incoming "
+                        "reference rather than an internal synth setpoint."
+                    )
+            ok_wheel, measured_wheel = _safe_call("Get wheel type", controller.getWheelType)
+            ok_sync, measured_sync = _safe_call("Get sync mode", controller.getSync)
+            ok_mode, measured_mode = _safe_call("Get controller mode", controller.getMode)
             ok_read, measured_frequency = _safe_call(
                 "Get synth frequency", controller.getSynthFreq
             )
+            if ok_wheel or ok_sync or ok_mode:
+                parts = []
+                if ok_wheel:
+                    parts.append(
+                        f"wheel={measured_wheel} ({wheel_names.get(int(measured_wheel), 'unknown')})"
+                    )
+                if ok_sync:
+                    parts.append(
+                        f"sync={measured_sync} ({sync_names.get(int(measured_sync), 'unknown')})"
+                    )
+                if ok_mode:
+                    parts.append(
+                        f"mode={measured_mode} ({mode_names.get(int(measured_mode), 'unknown')})"
+                    )
+                _log("Reported settings: " + ", ".join(parts))
             if ok_read:
-                _log(
-                    "Frequency summary: "
-                    f"requested={target_frequency_hz:.3f} Hz, "
-                    f"reported={float(measured_frequency):.3f} Hz"
-                )
-            _log("Start/configure command complete. Exiting.")
+                if target_sync == 3:
+                    _log(
+                        "Frequency summary: "
+                        f"requested synth={target_frequency_hz:.3f} Hz, "
+                        f"reported synth={float(measured_frequency):.3f} Hz"
+                    )
+                else:
+                    _log(
+                        "External-sync summary: "
+                        f"expected Sync In ~{target_frequency_hz:.3f} Hz, "
+                        f"reported synth memory={float(measured_frequency):.3f} Hz "
+                        "(not the external reference)."
+                    )
+            _log("Status/configure command complete. Exiting.")
 
     except KeyboardInterrupt:
         _log("Interrupted by user.")

@@ -91,10 +91,19 @@ class newport_3502_chopper_controller():
         res = self.driver.SetMode(self.devicekey, mode)
         return res
 
-    def getMode(self, mode_ref):
+    def getMode(self):
         self._ensure_ready()
-        res = self.driver.GetMode(self.devicekey,mode_ref)
-        return res
+        result = self.driver.GetMode(self.devicekey, 0)
+        if isinstance(result, tuple):
+            return result[1]
+        return result
+
+    def getSync(self):
+        self._ensure_ready()
+        result = self.driver.GetSync(self.devicekey, 0)
+        if isinstance(result, tuple):
+            return result[1]
+        return result
 
     def getSynthFreq(self):
         self._ensure_ready()
