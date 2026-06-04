@@ -23,6 +23,7 @@ env/
 Thumbs.db
 
 # Data/output artifacts
+data/
 optimization_results/
 lucky_captures/
 acquisition_results/

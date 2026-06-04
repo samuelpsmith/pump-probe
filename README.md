@@ -4,7 +4,12 @@ Tools for pump-probe laser spectroscopy experiments controlled by Python.
 
 ## What Is Included
 
-- `DAQ_pda_simple.py`: stand-alone NI-DAQmx control and live plotting script for CMOS/PDA-style line acquisition.
+- `live_cmos.py`: lightweight shared-package live CMOS/PDA setup tool built on the new `pump_probe/` architecture.
+- `linear_absorption.py`: shared-package linear absorption runner that saves raw stacks plus processed absorbance.
+- `transient_absorption.py`: shared-package transient absorption runner with explicit delay lists and per-delay raw-stack saving.
+- `steady_state_cd.py`: shared-package steady-state circular dichroism runner for odd/even polarization modulation experiments.
+- `pump_probe/`: shared package for DAQ adapters, calibrations, processing, and experiment runners under active refactor.
+- `DAQ_pda_simple.py`: legacy stand-alone NI-DAQmx control and live plotting script for CMOS/PDA-style line acquisition.
 - `DAQ_pda_hard.py`: hardware-timed/retrigger-focused CMOS/PDA runner with persistent session mode, timing sweep tools, and richer diagnostics.
 - `stepper_control/conex_raster.py`: CONEX-PP raster stage runner (WLG crystal raster).
 - `stepper_control/chopper.py`: Newport 3502 chopper diagnostic/control runner.
@@ -48,6 +53,36 @@ pip install -r requirements.txt
 
 ```powershell
 python DAQ_pda_simple.py
+```
+
+For the new lightweight shared-package live tool:
+
+```powershell
+python live_cmos.py
+```
+
+For the first shared-package experiment runner:
+
+```powershell
+python linear_absorption.py --sample-name MySample
+```
+
+For the first shared-package transient absorption runner:
+
+```powershell
+python transient_absorption.py --sample-name MySample --zero-position-mm 0.0 --delay-ps 0 --delay-ps 1 --delay-ps 10
+```
+
+Or from a JSON config file:
+
+```powershell
+python transient_absorption.py --config configs/examples/transient_absorption_example.json
+```
+
+For the first shared-package steady-state CD runner:
+
+```powershell
+python steady_state_cd.py --sample-name MySample
 ```
 
 For the hardware-timed retrigger script:
@@ -98,6 +133,51 @@ Edit the configuration block near the bottom of `DAQ_pda_simple.py` to set:
 - timing profile
 - capture window
 - live plotting mode (`main`, `ref`, or `both`)
+
+`live_cmos.py` exposes these options directly on the CLI instead of relying on
+an in-file configuration block.
+
+`linear_absorption.py` walks through a two-step acquisition by default:
+
+1. acquire the reference condition (`sample out`, pump blocked)
+2. acquire the sample condition (`sample in`, pump blocked)
+
+It saves:
+
+- raw accepted reference lines
+- raw accepted sample lines
+- processed transmission / absorbance
+- run metadata and DAQ setup
+
+`transient_absorption.py` currently uses a manual-stage workflow by default:
+
+1. provide an explicit delay list on the CLI or from a file
+2. move the delay stage to each prompted position
+3. acquire odd/even demod data for each delay point
+
+It also supports:
+
+- XPS-driven stage motion (`--stage-mode xps`)
+- merged multi-scan outputs with scan-to-scan statistics
+- optional dark-offset subtraction from a saved baseline file
+- optional saving of a new dark-offset baseline from a blocked-pump run
+- grouped subaverages and simple outlier masks for each raw delay-point stack
+
+It saves:
+
+- raw accepted lines for every delay point
+- processed per-delay pump-on / pump-off / delta spectra
+- per-scan aggregated `delta_OD` and `delta_T/T`
+- merged multi-scan `delta_OD` / `delta_T/T` means, std, sem, and per-scan stacks
+- run metadata, DAQ setup, and delay calibration
+- an overview PNG of the merged `delta_OD`
+
+`steady_state_cd.py` currently acquires one odd/even modulation stack and saves:
+
+- raw accepted lines
+- grouped sub-averages and simple outlier metrics
+- left/right bucket means
+- raw and normalized circular-difference spectra
 
 ## License
 

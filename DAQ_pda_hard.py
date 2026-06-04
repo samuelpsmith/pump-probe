@@ -37,6 +37,7 @@ from nidaqmx.constants import (
     AcquisitionType,
     Edge,
     ExportAction,
+    LineGrouping,
     Level,
     TerminalConfiguration,
     LoggingMode,
@@ -71,7 +72,9 @@ class PDAControllerDAQSimple:
     Simple NI-6363 PDA/CMOS control path:
     - ctr0 outputs ST on PFI8
     - ctr1 outputs CLK on PFI4
-    - AI is sampled by ctr1 internal output (one sample per CLK pulse)
+    - AI is sampled either by ctr1 internal output or by a divided ctr2 clock
+    - optional chopper sync output is routed on PFI3
+    - optional external chopper FOUT TTL input can be observed on PFI14
     - AI and CLK are started from ST internal output for fixed phase alignment
     """
 
@@ -170,6 +173,75 @@ class PDAControllerDAQSimple:
         "clk_initial_delay": 0.0,
     }
 
+    SHORT_LINE_SINGLE_CHANNEL_TIMING = {
+        "description": (
+            "Guard-derived short-line single-channel profile: 2 MHz clock, "
+            "14 dummy clocks, 505 valid pixel clocks, and ~264 us capture end."
+        ),
+        "st_high_time": 4e-6,
+        "st_low_time": 986e-6,
+        "st_initial_delay": 0.0,
+        "clk_high_time": 250e-9,
+        "clk_low_time": 250e-9,
+        "clk_initial_delay": 0.0,
+        "dummy_clocks": 14,
+        "pixel_clocks": 505,
+        "start_on_st_fall": True,
+    }
+
+    DECIMATED_2CHANNEL_TIMING = {
+        "description": (
+            "Full-span two-channel decimated profile: detector CLK at 2 MHz, "
+            "AI sample clock divided by 2 to 1 MHz, 14 dummy clocks, 1024 valid "
+            "pixel clocks, and ~523 us capture end."
+        ),
+        "st_high_time": 4e-6,
+        "st_low_time": 986e-6,
+        "st_initial_delay": 0.0,
+        "clk_high_time": 250e-9,
+        "clk_low_time": 250e-9,
+        "clk_initial_delay": 0.0,
+        "dummy_clocks": 14,
+        "pixel_clocks": 1024,
+        "start_on_st_fall": True,
+        "ai_sample_clock_divisor": 2,
+    }
+
+    ALMOST_FULL_2CHANNEL_TIMING = {
+        "description": (
+            "Near-full two-channel profile: 1 MHz CLK/AI sampling, 14 dummy "
+            "clocks, 972 valid pixel clocks, and ~990 us capture end."
+        ),
+        "st_high_time": 4e-6,
+        "st_low_time": 986e-6,
+        "st_initial_delay": 0.0,
+        "clk_high_time": 500e-9,
+        "clk_low_time": 500e-9,
+        "clk_initial_delay": 0.0,
+        "dummy_clocks": 14,
+        "pixel_clocks": 972,
+        "start_on_st_fall": True,
+        "ai_sample_clock_divisor": 1,
+    }
+
+    ALMOST_FULL_SINGLE_CHANNEL_TIMING = {
+        "description": (
+            "Single-channel diagnostic equivalent of almost_full_2channel: "
+            "1 MHz CLK/AI sampling, 14 dummy clocks, 972 valid pixel clocks, "
+            "and ~990 us capture end."
+        ),
+        "st_high_time": 4e-6,
+        "st_low_time": 986e-6,
+        "st_initial_delay": 0.0,
+        "clk_high_time": 500e-9,
+        "clk_low_time": 500e-9,
+        "clk_initial_delay": 0.0,
+        "dummy_clocks": 14,
+        "pixel_clocks": 972,
+        "start_on_st_fall": True,
+        "ai_sample_clock_divisor": 1,
+    }
+
     # Named profiles make it explicit which timing set is active.
     TIMING_PROFILES = {
         "main_1khz_safe": MAIN_1KHZ_SAFE_TIMING,
@@ -179,6 +251,10 @@ class PDAControllerDAQSimple:
         "improved_guess_2channel": IMPROVED_GUESS_TIMING_2CHANNEL,
         "toofast_guess": TOOFAST_GUESS_TIMING,
         "guard_10us": GUARD_10US_TIMING,
+        "short_line_single_channel": SHORT_LINE_SINGLE_CHANNEL_TIMING,
+        "decimated_2channel": DECIMATED_2CHANNEL_TIMING,
+        "almost_full_2channel": ALMOST_FULL_2CHANNEL_TIMING,
+        "almost_full_single_channel": ALMOST_FULL_SINGLE_CHANNEL_TIMING,
     }
     DEFAULT_TIMING_PROFILE = "guard_10us"
 
@@ -192,6 +268,7 @@ class PDAControllerDAQSimple:
         st_pfi="PFI8",
         clk_pfi="PFI4",
         chopper_sync_pfi="PFI3",
+        chopper_input_pfi="PFI14",
     ):
         self.device = str(device)
         self.num_pixels = int(num_pixels)
@@ -202,12 +279,16 @@ class PDAControllerDAQSimple:
         self.st_out_term = f"/{self.device}/{st_pfi}"
         self.clk_out_term = f"/{self.device}/{clk_pfi}"
         self.chopper_sync_out_term = f"/{self.device}/{chopper_sync_pfi}"
+        self.chopper_input_term = f"/{self.device}/{chopper_input_pfi}"
 
         self.st_counter = f"{self.device}/ctr0"
         self.clk_counter = f"{self.device}/ctr1"
+        self.ai_sample_clock_counter = f"{self.device}/ctr2"
         self.chopper_sync_counter = f"{self.device}/ctr3"
         self.st_internal_output = f"/{self.device}/Ctr0InternalOutput"
-        self.ai_sample_clk_src = f"/{self.device}/Ctr1InternalOutput"
+        self.detector_clk_internal_output = f"/{self.device}/Ctr1InternalOutput"
+        self.ai_sample_clock_internal_output = f"/{self.device}/Ctr2InternalOutput"
+        self.ai_sample_clk_src = self.detector_clk_internal_output
 
         self.st_high_time = 0.0
         self.st_low_time = 0.0
@@ -220,6 +301,8 @@ class PDAControllerDAQSimple:
         self.clk_high_time = 0.0
         self.clk_low_time = 0.0
         self.clk_initial_delay = 0.0
+        self.ai_sample_clock_divisor = 1
+        self.ai_sample_clock_initial_delay = 0.0
 
         self.ai_min = -10.0
         self.ai_max = 10.0
@@ -253,6 +336,8 @@ class PDAControllerDAQSimple:
         # - First `video_dummy_clocks` samples are pre-video clocks, then pixels.
         self.ai_start_trigger_edge = Edge.FALLING
         self.video_dummy_clocks = 14
+        self.video_pixel_clocks = self.num_pixels
+        self.video_output_samples = self.num_pixels
 
         # Legacy-like windowing around active video
         self.ai_ignored_samples = 0 #Was 16
@@ -293,6 +378,18 @@ class PDAControllerDAQSimple:
             low_time_s=clk_low,
             initial_delay_s=cfg["clk_initial_delay"],
         )
+        self.set_ai_sample_clock_divisor(
+            cfg.get("ai_sample_clock_divisor", 1),
+            initial_delay_s=cfg.get(
+                "ai_sample_clock_initial_delay",
+                cfg["clk_initial_delay"],
+            ),
+        )
+        self.set_video_timing(
+            dummy_clocks=cfg.get("dummy_clocks", 14),
+            pixel_clocks=cfg.get("pixel_clocks", self.num_pixels),
+            start_on_st_fall=cfg.get("start_on_st_fall", True),
+        )
 
     def set_st_timing(self, high_time_s, low_time_s, initial_delay_s=0.0):
         self.st_high_time = float(high_time_s)
@@ -306,6 +403,30 @@ class PDAControllerDAQSimple:
         self.clk_high_time = float(high_time_s)
         self.clk_low_time = float(low_time_s)
         self.clk_initial_delay = float(initial_delay_s)
+
+    def set_ai_sample_clock_divisor(self, divisor=1, initial_delay_s=None):
+        """
+        Set the AI sampling clock relative to the detector CLK.
+
+        divisor=1 keeps legacy behavior: AI samples directly from the detector
+        CLK counter internal output. divisor>1 uses ctr2 as a separate AI
+        sample clock, allowing the detector to continue clocking pixels faster
+        than the analog input scan rate.
+        """
+        div = int(divisor)
+        if div < 1:
+            raise ValueError("ai_sample_clock_divisor must be >= 1.")
+        self.ai_sample_clock_divisor = div
+        self.ai_sample_clock_initial_delay = (
+            self.clk_initial_delay
+            if initial_delay_s is None
+            else float(initial_delay_s)
+        )
+        self.ai_sample_clk_src = (
+            self.detector_clk_internal_output
+            if div == 1
+            else self.ai_sample_clock_internal_output
+        )
 
     @property
     def st_high_period_s(self):
@@ -382,6 +503,12 @@ class PDAControllerDAQSimple:
         self.chopper_sync_high_ticks = max(1, int(high_ticks))
         self.chopper_sync_low_ticks = max(1, int(low_ticks))
 
+    def set_chopper_input_terminal(self, in_pfi="PFI14"):
+        """
+        Configure the PFI terminal used for incoming chopper FOUT TTL.
+        """
+        self.chopper_input_term = f"/{self.device}/{str(in_pfi).lstrip('/')}"
+
     def set_retrigger_initial_delay(self, enable=True):
         self.retrigger_enable_initial_delay = bool(enable)
 
@@ -420,31 +547,35 @@ class PDAControllerDAQSimple:
         self.ai_ignored_samples = max(0, int(ignored_samples))
         self.ai_trailing_samples = max(0, int(trailing_samples))
 
-    def set_capture_window_samples(self, total_samples, ignored_samples=0):
+    def set_capture_window_samples(self, total_samples, ignored_samples=0, valid_samples=None):
         """
         Set total acquired samples per line directly.
 
-        total_samples = num_pixels + ignored_samples + trailing_samples
+        total_samples = valid_samples + ignored_samples + trailing_samples
         """
         total = int(total_samples)
         ignored = int(ignored_samples)
-        if total < self.num_pixels:
+        valid = int(self.video_pixel_clocks if valid_samples is None else valid_samples)
+        if valid <= 0:
+            raise ValueError("valid_samples must be > 0.")
+        if total < valid:
             raise ValueError(
-                f"total_samples ({total}) must be >= num_pixels ({self.num_pixels})."
+                f"total_samples ({total}) must be >= valid_samples ({valid})."
             )
         if ignored < 0:
             raise ValueError("ignored_samples must be >= 0.")
 
-        trailing = total - self.num_pixels - ignored
+        trailing = total - valid - ignored
         if trailing < 0:
             raise ValueError(
-                "ignored_samples is too large for requested total_samples and num_pixels."
+                "ignored_samples is too large for requested total_samples and valid_samples."
             )
         self.set_line_windowing(
             enable=True,
             ignored_samples=ignored,
             trailing_samples=trailing,
         )
+        self.video_output_samples = valid
 
     def set_output_cropping(self, enable=True):
         self.crop_output_to_valid_pixels = bool(enable)
@@ -466,7 +597,8 @@ class PDAControllerDAQSimple:
           Number of leading clocks to keep before valid pixel clocks.
 
         pixel_clocks:
-          Must currently match num_pixels for simple cropping semantics.
+          Number of valid pixel clocks to acquire after dummy clocks. This may
+          be less than num_pixels for short-line/ROI timing tests.
         """
         dummy = int(dummy_clocks)
         pixels = int(self.num_pixels if pixel_clocks is None else pixel_clocks)
@@ -474,20 +606,26 @@ class PDAControllerDAQSimple:
             raise ValueError("dummy_clocks must be >= 0.")
         if pixels <= 0:
             raise ValueError("pixel_clocks must be > 0.")
-        if pixels != int(self.num_pixels):
+        if pixels > int(self.num_pixels):
             raise ValueError(
-                "pixel_clocks must match num_pixels in this simple runner."
+                f"pixel_clocks ({pixels}) must be <= num_pixels ({self.num_pixels})."
             )
 
         self.video_dummy_clocks = dummy
+        self.video_pixel_clocks = pixels
         self.ai_start_trigger_edge = (
             Edge.FALLING if bool(start_on_st_fall) else Edge.RISING
         )
+        sample_divisor = max(1, int(self.ai_sample_clock_divisor))
+        ignored_samples = int(np.ceil(dummy / float(sample_divisor)))
+        valid_samples = int(np.ceil(pixels / float(sample_divisor)))
+        total_samples = int(np.ceil((dummy + pixels) / float(sample_divisor)))
         # Keep dummy clocks in front of the valid-pixel region so optional
-        # cropping can return exactly num_pixels when enabled.
+        # cropping can return exactly the requested pixel-clock count.
         self.set_capture_window_samples(
-            total_samples=(self.num_pixels + dummy),
-            ignored_samples=dummy,
+            total_samples=total_samples,
+            ignored_samples=ignored_samples,
+            valid_samples=valid_samples,
         )
 
     @property
@@ -495,23 +633,36 @@ class PDAControllerDAQSimple:
         return 1.0 / (self.clk_high_time + self.clk_low_time)
 
     @property
+    def ai_sample_rate(self):
+        return self.clk_rate / float(max(1, int(self.ai_sample_clock_divisor)))
+
+    @property
+    def uses_separate_ai_sample_clock(self):
+        return int(self.ai_sample_clock_divisor) != 1
+
+    @property
     def st_period_s(self):
         return float(self.st_high_time + self.st_low_time)
 
     @property
     def ai_samples_per_line(self):
-        return int(self.num_pixels + self.ai_ignored_samples + self.ai_trailing_samples)
+        return int(self.video_output_samples + self.ai_ignored_samples + self.ai_trailing_samples)
 
     @property
     def output_samples_per_line(self):
         if self.crop_output_to_valid_pixels:
-            return int(self.num_pixels)
+            return int(self.video_output_samples)
         return int(self.ai_samples_per_line)
+
+    def output_sample_axis(self, sample_count=None):
+        count = self.output_samples_per_line if sample_count is None else int(sample_count)
+        divisor = max(1, int(self.ai_sample_clock_divisor))
+        return np.arange(count, dtype=float) * float(divisor)
 
     @property
     def sample_window_s(self):
         # Window duration between first and last sample edges.
-        return max(0, self.ai_samples_per_line - 1) / self.clk_rate
+        return max(0, self.ai_samples_per_line - 1) / self.ai_sample_rate
 
     @property
     def pre_ai_clock_count(self):
@@ -523,40 +674,62 @@ class PDAControllerDAQSimple:
         return max(0, int(round(pre)))
 
     @property
+    def pre_ai_sample_clock_count(self):
+        capture = self._compute_capture_timing()
+        pre = (
+            (capture["first_sample_s"] - capture["ai_sample_clk_start_s"])
+            / capture["ai_sample_period_s"]
+        )
+        return max(0, int(round(pre)))
+
+    @property
     def clk_pulses_per_line(self):
-        return int(self.ai_samples_per_line + self.pre_ai_clock_count)
+        detector_clocks_per_line = int(self.video_dummy_clocks + self.video_pixel_clocks)
+        return int(detector_clocks_per_line + self.pre_ai_clock_count)
+
+    @property
+    def ai_sample_clock_pulses_per_line(self):
+        return int(self.ai_samples_per_line + self.pre_ai_sample_clock_count)
 
     def _compute_capture_timing(self):
         clk_period_s = 1.0 / self.clk_rate
+        ai_sample_period_s = 1.0 / self.ai_sample_rate
         st_rise_s = self.st_initial_delay
         st_fall_s = self.st_initial_delay + self.st_high_time
         clk_start_s = self.st_initial_delay + self.clk_initial_delay
+        ai_sample_clk_start_s = (
+            self.st_initial_delay + self.ai_sample_clock_initial_delay
+        )
 
-        # AI starts from ST internal edge, then samples on the first CLK rising
-        # edge that occurs after that AI trigger edge.
+        # AI starts from ST internal edge, then samples on the first AI-sample
+        # clock edge that occurs after that AI trigger edge.
         ai_start_event_s = (
             st_fall_s
             if self.ai_start_trigger_edge == Edge.FALLING
             else st_rise_s
         )
         strict_after = self.ai_start_trigger_edge == Edge.FALLING
-        if ai_start_event_s < clk_start_s:
-            first_sample_s = clk_start_s
+        if ai_start_event_s < ai_sample_clk_start_s:
+            first_sample_s = ai_sample_clk_start_s
         else:
-            rel = (ai_start_event_s - clk_start_s) / clk_period_s
+            rel = (ai_start_event_s - ai_sample_clk_start_s) / ai_sample_period_s
             if strict_after:
                 n_edges = int(np.floor(rel + 1e-12)) + 1
             else:
                 n_edges = int(np.ceil(rel - 1e-12))
-            first_sample_s = clk_start_s + max(0, n_edges) * clk_period_s
+            first_sample_s = (
+                ai_sample_clk_start_s + max(0, n_edges) * ai_sample_period_s
+            )
 
         capture_window_s = self.sample_window_s
         capture_end_s = first_sample_s + capture_window_s
         return {
             "clk_period_s": clk_period_s,
+            "ai_sample_period_s": ai_sample_period_s,
             "st_rise_s": st_rise_s,
             "st_fall_s": st_fall_s,
             "clk_start_s": clk_start_s,
+            "ai_sample_clk_start_s": ai_sample_clk_start_s,
             "ai_start_event_s": ai_start_event_s,
             "first_sample_s": first_sample_s,
             "capture_window_s": capture_window_s,
@@ -572,16 +745,23 @@ class PDAControllerDAQSimple:
         timing = {
             "clk_rate_hz": self.clk_rate,
             "clk_period_s": 1.0 / self.clk_rate,
+            "ai_sample_rate_hz": self.ai_sample_rate,
+            "ai_sample_period_s": 1.0 / self.ai_sample_rate,
+            "ai_sample_clock_divisor": int(self.ai_sample_clock_divisor),
+            "ai_sample_clock_source": str(self.ai_sample_clk_src),
             "st_high_s": self.st_high_time,
             "st_low_s": self.st_low_time,
             "st_period_s": st_period_s,
             "st_initial_delay_s": self.st_initial_delay,
             "clk_initial_delay_s": self.clk_initial_delay,
+            "ai_sample_clock_initial_delay_s": self.ai_sample_clock_initial_delay,
             "sample_window_s": sample_window_s,
             "total_trigger_to_end_s": total_trigger_to_end_s,
             "limiting_cycle_s": limiting_cycle_s,
             "pre_ai_clock_count": self.pre_ai_clock_count,
+            "pre_ai_sample_clock_count": self.pre_ai_sample_clock_count,
             "clk_pulses_per_line": self.clk_pulses_per_line,
+            "ai_sample_clock_pulses_per_line": self.ai_sample_clock_pulses_per_line,
             "samples_per_line_read": self.ai_samples_per_line,
             "samples_per_line_output": self.output_samples_per_line,
         }
@@ -605,10 +785,13 @@ class PDAControllerDAQSimple:
         capture_start_s = capture["first_sample_s"]
         capture_end_s = capture["capture_end_s"]
         ai_start_event_s = capture["ai_start_event_s"]
+        ai_sample_period_s = capture["ai_sample_period_s"]
+        ai_sample_clk_start_s = capture["ai_sample_clk_start_s"]
         dummy_clock_span_s = float(self.video_dummy_clocks) * clk_period_s
         video_valid_start_s = capture_start_s + dummy_clock_span_s
         video_valid_end_s = (
-            video_valid_start_s + max(0, self.num_pixels - 1) * clk_period_s
+            video_valid_start_s
+            + max(0, self.video_output_samples - 1) * ai_sample_period_s
         )
 
         timing = self.estimate_line_timing(trigger_frequency_hz=trigger_frequency_hz)
@@ -620,6 +803,7 @@ class PDAControllerDAQSimple:
             "st_rise_s": st_rise_s,
             "st_fall_s": st_fall_s,
             "clk_start_s": clk_start_s,
+            "ai_sample_clk_start_s": ai_sample_clk_start_s,
             "ai_start_edge_label": (
                 "ST falling" if self.ai_start_trigger_edge == Edge.FALLING else "ST rising"
             ),
@@ -630,11 +814,20 @@ class PDAControllerDAQSimple:
             "capture_window_s": capture_window_s,
             "capture_end_s": capture_end_s,
             "video_dummy_clocks": int(self.video_dummy_clocks),
+            "video_pixel_clocks": int(self.video_pixel_clocks),
+            "video_output_samples": int(self.video_output_samples),
             "video_valid_start_s": video_valid_start_s,
             "video_valid_end_s": video_valid_end_s,
             "pre_ai_clock_count": int(self.pre_ai_clock_count),
+            "pre_ai_sample_clock_count": int(self.pre_ai_sample_clock_count),
             "clk_pulses_per_line": int(self.clk_pulses_per_line),
+            "ai_sample_clock_pulses_per_line": int(
+                self.ai_sample_clock_pulses_per_line
+            ),
             "clk_rate_hz": self.clk_rate,
+            "ai_sample_rate_hz": self.ai_sample_rate,
+            "ai_sample_clock_divisor": int(self.ai_sample_clock_divisor),
+            "ai_sample_clock_source": str(self.ai_sample_clk_src),
             "samples_per_line_read": self.ai_samples_per_line,
             "timing_margin_s": timing.get("timing_margin_s"),
             "trigger_period_s": timing.get("trigger_period_s"),
@@ -653,11 +846,17 @@ class PDAControllerDAQSimple:
             f"ST fall: {d['st_fall_s'] * 1e6:.1f} us",
             f"CLK start: {d['clk_start_s'] * 1e6:.1f} us",
             (
+                "AI sample clock: "
+                f"{d['ai_sample_rate_hz'] / 1e6:.3f} MHz "
+                f"(divisor={d['ai_sample_clock_divisor']}, "
+                f"source={d['ai_sample_clock_source']})"
+            ),
+            (
                 f"AI start edge: {d['ai_start_edge_label']} "
                 f"@ {d['ai_start_event_s'] * 1e6:.1f} us"
             ),
             (
-                "Capture start (first CLK after AI edge): "
+                "Capture start (first AI sample clock after AI edge): "
                 f"{d['capture_start_s'] * 1e6:.1f} us"
             ),
             (
@@ -673,7 +872,12 @@ class PDAControllerDAQSimple:
             (
                 "CLK pulses per line: "
                 f"{d['clk_pulses_per_line']} "
-                f"(pre-AI clocks: {d['pre_ai_clock_count']})"
+                f"(pre-AI detector clocks: {d['pre_ai_clock_count']})"
+            ),
+            (
+                "AI sample-clock pulses per line: "
+                f"{d['ai_sample_clock_pulses_per_line']} "
+                f"(pre-AI sample clocks: {d['pre_ai_sample_clock_count']})"
             ),
             (
                 "Video dummy clocks before pixels: "
@@ -696,23 +900,25 @@ class PDAControllerDAQSimple:
         return "\n".join(lines)
 
     def _validate_scan_rate(self, num_ai_channels=1):
-        f_clk = self.clk_rate
-        if f_clk <= 0.0:
-            raise ValueError("CLK rate must be > 0.")
+        f_scan = self.ai_sample_rate
+        if self.clk_rate <= 0.0:
+            raise ValueError("Detector CLK rate must be > 0.")
+        if f_scan <= 0.0:
+            raise ValueError("AI sample clock rate must be > 0.")
         channels = max(1, int(num_ai_channels))
         hard_limit_scan_rate = self.ai_max_conversion_rate / channels
-        if f_clk > hard_limit_scan_rate:
+        if f_scan > hard_limit_scan_rate:
             raise ValueError(
-                f"Requested sample clock {f_clk:.3f} Hz exceeds NI-6363 "
+                f"Requested AI sample clock {f_scan:.3f} Hz exceeds NI-6363 "
                 f"limit for {channels} channel(s): {hard_limit_scan_rate:.3f} Hz."
             )
         recommended_max_scan_rate = hard_limit_scan_rate * float(
             self.ai_recommended_utilization
         )
-        if f_clk > recommended_max_scan_rate and channels not in self._scan_rate_warned_channels:
+        if f_scan > recommended_max_scan_rate and channels not in self._scan_rate_warned_channels:
             print(
-                "Warning: sample clock is near NI-6363 conversion ceiling "
-                f"for {channels} channel(s): requested={f_clk:.0f} Hz, "
+                "Warning: AI sample clock is near NI-6363 conversion ceiling "
+                f"for {channels} channel(s): requested={f_scan:.0f} Hz, "
                 f"recommended<={recommended_max_scan_rate:.0f} Hz "
                 f"(hard max {hard_limit_scan_rate:.0f} Hz). "
                 "You may see settling warnings (200011) or reduced accuracy."
@@ -738,9 +944,10 @@ class PDAControllerDAQSimple:
                 terminal_config=self.ai_terminal_config,
             )
 
-        # AI is explicitly clocked from the counter-generated CLK pulses.
+        # AI is explicitly clocked from either the detector CLK (legacy) or a
+        # divided AI sample clock (decimated modes).
         ai_task.timing.cfg_samp_clk_timing(
-            rate=self.clk_rate,
+            rate=self.ai_sample_rate,
             source=self.ai_sample_clk_src,
             active_edge=Edge.RISING,
             sample_mode=AcquisitionType.FINITE,
@@ -780,7 +987,25 @@ class PDAControllerDAQSimple:
         )
         return clk_task
 
-    def _apply_start_trigger_chain(self, ai_task, st_task, clk_task):
+    def _build_ai_sample_clk_task(self):
+        if not self.uses_separate_ai_sample_clock:
+            return None
+        period_s = 1.0 / self.ai_sample_rate
+        ai_clk_task = nidaqmx.Task("PDA_AI_SAMPLE_CLK")
+        ai_clk_task.co_channels.add_co_pulse_chan_time(
+            counter=self.ai_sample_clock_counter,
+            idle_state=Level.LOW,
+            initial_delay=self.ai_sample_clock_initial_delay,
+            low_time=0.5 * period_s,
+            high_time=0.5 * period_s,
+        )
+        ai_clk_task.timing.cfg_implicit_timing(
+            sample_mode=AcquisitionType.FINITE,
+            samps_per_chan=self.ai_sample_clock_pulses_per_line,
+        )
+        return ai_clk_task
+
+    def _apply_start_trigger_chain(self, ai_task, st_task, clk_task, ai_sample_clk_task=None):
         ai_task.triggers.start_trigger.cfg_dig_edge_start_trig(
             trigger_source=self.st_internal_output,
             trigger_edge=self.ai_start_trigger_edge,
@@ -789,6 +1014,11 @@ class PDAControllerDAQSimple:
             trigger_source=self.st_internal_output,
             trigger_edge=Edge.RISING,
         )
+        if ai_sample_clk_task is not None:
+            ai_sample_clk_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+                trigger_source=self.st_internal_output,
+                trigger_edge=Edge.RISING,
+            )
         if self.use_external_trigger:
             st_task.triggers.start_trigger.cfg_dig_edge_start_trig(
                 trigger_source=self.trig_in,
@@ -806,7 +1036,7 @@ class PDAControllerDAQSimple:
             return arr
 
         start = int(self.ai_ignored_samples)
-        stop = int(start + self.num_pixels)
+        stop = int(start + self.video_output_samples)
         if arr.ndim == 1:
             if arr.size < stop:
                 raise RuntimeError(
@@ -846,12 +1076,24 @@ class PDAControllerDAQSimple:
 
         with self._build_ai_task(read_reference=read_reference) as ai_task, \
              self._build_st_task() as st_task, \
-             self._build_clk_task() as clk_task:
+             self._build_clk_task() as clk_task, \
+             (
+                 self._build_ai_sample_clk_task()
+                 if self.uses_separate_ai_sample_clock
+                 else nullcontext(None)
+             ) as ai_sample_clk_task:
 
-            self._apply_start_trigger_chain(ai_task, st_task, clk_task)
+            self._apply_start_trigger_chain(
+                ai_task,
+                st_task,
+                clk_task,
+                ai_sample_clk_task=ai_sample_clk_task,
+            )
 
             # Arm in downstream-to-upstream order.
             ai_task.start()
+            if ai_sample_clk_task is not None:
+                ai_sample_clk_task.start()
             clk_task.start()
             st_task.start()
 
@@ -904,6 +1146,7 @@ class _RetriggerLineSession:
         self.ai_task = None
         self.st_task = None
         self.clk_task = None
+        self.ai_sample_clk_task = None
         self._buffer_size_warned = False
         self._tdms_warned = False
         self._latest_read_warned = False
@@ -984,7 +1227,14 @@ class _RetriggerLineSession:
                     self._latest_read_warned = True
         self.st_task = self.pda._build_st_task()
         self.clk_task = self.pda._build_clk_task()
-        for task_obj, task_label in ((self.st_task, "ST"), (self.clk_task, "CLK")):
+        self.ai_sample_clk_task = self.pda._build_ai_sample_clk_task()
+        for task_obj, task_label in (
+            (self.st_task, "ST"),
+            (self.clk_task, "CLK"),
+            (self.ai_sample_clk_task, "AI sample clock"),
+        ):
+            if task_obj is None:
+                continue
             try:
                 task_obj.co_channels[0].co_enable_initial_delay_on_retrigger = bool(
                     self.pda.retrigger_enable_initial_delay
@@ -997,13 +1247,22 @@ class _RetriggerLineSession:
                     )
                     self.pda._retrigger_delay_warned = True
 
-        self.pda._apply_start_trigger_chain(self.ai_task, self.st_task, self.clk_task)
+        self.pda._apply_start_trigger_chain(
+            self.ai_task,
+            self.st_task,
+            self.clk_task,
+            ai_sample_clk_task=self.ai_sample_clk_task,
+        )
         self.pda._set_retriggerable(self.ai_task, True)
         self.pda._set_retriggerable(self.clk_task, True)
+        if self.ai_sample_clk_task is not None:
+            self.pda._set_retriggerable(self.ai_sample_clk_task, True)
         self.pda._set_retriggerable(self.st_task, True)
 
         # Arm downstream first.
         self.ai_task.start()
+        if self.ai_sample_clk_task is not None:
+            self.ai_sample_clk_task.start()
         self.clk_task.start()
         self.st_task.start()
         return self
@@ -1058,8 +1317,71 @@ class _RetriggerLineSession:
         )
         return self.pda._format_ai_read_data(data, read_reference=self.read_reference)
 
+    def read_available_lines(self, max_lines=16, timeout=10.0):
+        """
+        Read one or more ordered complete lines from the persistent AI buffer.
+
+        This amortizes NI-DAQmx/Python read overhead in high-throughput live
+        modes while preserving line order for phase-sensitive demodulation.
+        """
+        line_samples = int(self.pda.ai_samples_per_line)
+        max_lines = max(1, int(max_lines))
+        self.last_lines_consumed = 1
+
+        # Intentionally read a small fixed batch rather than one line at a
+        # time. DAQmx will block until this many complete lines are available,
+        # which greatly reduces Python/driver call overhead while preserving
+        # ordered line-by-line processing downstream.
+        lines_to_read = max_lines
+        samples_to_read = int(lines_to_read * line_samples)
+
+        data = self.ai_task.read(
+            number_of_samples_per_channel=samples_to_read,
+            timeout=float(timeout),
+        )
+        self.last_lines_consumed = int(lines_to_read)
+
+        arr = np.asarray(data, dtype=float)
+        lines = []
+        if self.read_reference:
+            if not (arr.ndim == 2 and arr.shape[0] == 2):
+                if lines_to_read == 1:
+                    return [
+                        self.pda._format_ai_read_data(
+                            data,
+                            read_reference=self.read_reference,
+                        )
+                    ]
+                raise RuntimeError(
+                    "Dual-channel batch read expected shape (2, n_samples), "
+                    f"got {tuple(arr.shape)}."
+                )
+            for idx in range(lines_to_read):
+                start = idx * line_samples
+                stop = start + line_samples
+                lines.append(
+                    self.pda._format_ai_read_data(
+                        arr[:, start:stop],
+                        read_reference=True,
+                    )
+                )
+            return lines
+
+        if arr.ndim == 2 and arr.shape[0] == 1:
+            arr = arr[0]
+        for idx in range(lines_to_read):
+            start = idx * line_samples
+            stop = start + line_samples
+            lines.append(
+                self.pda._format_ai_read_data(
+                    arr[start:stop],
+                    read_reference=False,
+                )
+            )
+        return lines
+
     def close(self):
-        for task in (self.st_task, self.clk_task, self.ai_task):
+        for task in (self.st_task, self.clk_task, self.ai_sample_clk_task, self.ai_task):
             if task is None:
                 continue
             try:
@@ -1073,25 +1395,34 @@ class _RetriggerLineSession:
         self.ai_task = None
         self.st_task = None
         self.clk_task = None
+        self.ai_sample_clk_task = None
 
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
 
 
-class _PFI9EdgeMonitorSession:
+class _CounterEdgeMonitorSession:
     """
-    Monitor PFI9 digital activity using a spare counter.
+    Monitor digital edge activity on a chosen DAQ terminal using a spare counter.
 
     Reports edge-rate (Hz). This is not an analog-voltage waveform.
     """
 
-    def __init__(self, pda, counter="ctr2", rate_gate_s=0.05):
+    def __init__(
+        self,
+        pda,
+        *,
+        source_terminal,
+        counter="ctr2",
+        rate_gate_s=0.05,
+        task_name="PDA_EDGE_MON",
+    ):
         self.pda = pda
+        self.source_terminal = str(source_terminal)
         self.counter = f"{self.pda.device}/{str(counter).lstrip('/')}"
-        # Allow short gates for higher-rate trigger diagnostics.
-        # This is an edge-rate monitor (not a waveform monitor), so shorter gates
-        # increase temporal sensitivity at the cost of noisier quantization.
+        self.task_name = str(task_name)
+        # Allow short gates for higher-rate diagnostics.
         self.rate_gate_s = max(0.001, float(rate_gate_s))
         self.task = None
         self.last_count = 0
@@ -1104,26 +1435,29 @@ class _PFI9EdgeMonitorSession:
 
     def __enter__(self):
         try:
-            self.task = nidaqmx.Task("PDA_PFI9_MON")
+            self.task = nidaqmx.Task(self.task_name)
             ch = self.task.ci_channels.add_ci_count_edges_chan(
                 counter=self.counter,
                 edge=Edge.RISING,
                 initial_count=0,
             )
-            self.task.ci_channels[0].ci_count_edges_term = self.pda.trig_in
+            self.task.ci_channels[0].ci_count_edges_term = self.source_terminal
             # PFI terminals are shared resources: if another task on this terminal
             # enabled a digital filter, NI-DAQmx requires matching filter settings.
             try:
-                ch.ci_count_edges_dig_fltr_enable = bool(self.pda.trigger_filter_enable)
+                ch.ci_count_edges_dig_fltr_enable = bool(
+                    self.pda.trigger_filter_enable
+                )
                 if self.pda.trigger_filter_enable:
                     ch.ci_count_edges_dig_fltr_min_pulse_width = float(
                         self.pda.trigger_filter_min_pulse_width_s
                     )
             except Exception:
-                # Non-fatal: if unsupported, continue without explicit CI filter setup.
                 pass
             try:
-                ch.ci_count_edges_dig_sync_enable = bool(self.pda.trigger_sync_enable)
+                ch.ci_count_edges_dig_sync_enable = bool(
+                    self.pda.trigger_sync_enable
+                )
             except Exception:
                 pass
             self.task.start()
@@ -1144,9 +1478,6 @@ class _PFI9EdgeMonitorSession:
             return float("nan"), None
         now = time.perf_counter()
         count = int(self.task.read())
-
-        # Compute edge rate over a fixed gate interval to avoid inflated values
-        # when the caller polls quickly (e.g., in persistent fast mode).
         gate_dt = now - self.gate_start_t
         gate_dc = count - self.gate_start_count
         if gate_dc < 0:
@@ -1169,6 +1500,91 @@ class _PFI9EdgeMonitorSession:
                 self.task.stop()
             except Exception:
                 pass
+            try:
+                self.task.close()
+            except Exception:
+                pass
+        self.task = None
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+class _PFI9EdgeMonitorSession(_CounterEdgeMonitorSession):
+    """
+    Monitor PFI9 digital activity using a spare counter.
+    """
+
+    def __init__(self, pda, counter="ctr2", rate_gate_s=0.05):
+        super().__init__(
+            pda,
+            source_terminal=pda.trig_in,
+            counter=counter,
+            rate_gate_s=rate_gate_s,
+            task_name="PDA_PFI9_MON",
+        )
+
+
+class _ChopperInputEdgeMonitorSession(_CounterEdgeMonitorSession):
+    """
+    Monitor external chopper FOUT TTL activity on the configured chopper input.
+    """
+
+    def __init__(self, pda, counter="ctr3", rate_gate_s=0.05):
+        super().__init__(
+            pda,
+            source_terminal=pda.chopper_input_term,
+            counter=counter,
+            rate_gate_s=rate_gate_s,
+            task_name="PDA_CHOPPER_IN_MON",
+        )
+
+
+class _ChopperInputStateSession:
+    """
+    Read the instantaneous logic level of the configured chopper input terminal.
+
+    This provides a per-line hardware phase label that can be used instead of
+    inferred odd/even or tail-guided phase assignment.
+    """
+
+    def __init__(self, pda, task_name="PDA_CHOPPER_IN_STATE"):
+        self.pda = pda
+        self.task_name = str(task_name)
+        self.task = None
+        self.available = False
+        self.error_text = ""
+
+    def __enter__(self):
+        try:
+            self.task = nidaqmx.Task(self.task_name)
+            self.task.di_channels.add_di_chan(
+                lines=self.pda.chopper_input_term,
+                line_grouping=LineGrouping.CHAN_PER_LINE,
+            )
+            self.available = True
+        except Exception as exc:
+            self.error_text = str(exc)
+            self.available = False
+            self.close()
+        return self
+
+    def read_state(self):
+        if self.task is None or not self.available:
+            return None
+        try:
+            value = self.task.read()
+        except Exception:
+            return None
+        if isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) <= 0:
+                return None
+            value = value[0]
+        return 1 if bool(value) else 0
+
+    def close(self):
+        if self.task is not None:
             try:
                 self.task.close()
             except Exception:
@@ -1372,8 +1788,19 @@ class _LiveLineAccumulator:
         integration_line_count=128,
         pump_chop_demod=False,
         pump_chop_sign=-1.0,
+        pump_chop_phase_source="inferred",
         pump_chop_use_adjacent_pairs=False,
         pump_chop_sign_agnostic_preview=False,
+        pump_chop_tail_heuristic_enable=False,
+        pump_chop_tail_heuristic_start=900,
+        pump_chop_tail_heuristic_stop=1000,
+        pump_chop_tail_heuristic_expected_sign=1.0,
+        pump_chop_tail_heuristic_zero_baseline=True,
+        reference_processing_mode="difference",
+        reference_ratio_floor=1e-6,
+        channel_dark_main_offset=None,
+        channel_dark_ref_offset=None,
+        pump_chop_dark_offset=None,
         capture_hit_rate_enable=True,
         capture_hit_rate_window_lines=256,
         capture_hit_warmup_lines=64,
@@ -1382,10 +1809,35 @@ class _LiveLineAccumulator:
         self.integration_line_count = max(1, int(integration_line_count))
         self.pump_chop_demod = bool(pump_chop_demod)
         self.pump_chop_sign = float(pump_chop_sign)
+        self.pump_chop_phase_source = str(pump_chop_phase_source).strip().lower()
+        if self.pump_chop_phase_source not in ("inferred", "chopper_input"):
+            raise ValueError(
+                "pump_chop_phase_source must be 'inferred' or 'chopper_input'."
+            )
         self.pump_chop_use_adjacent_pairs = bool(pump_chop_use_adjacent_pairs)
         self.pump_chop_sign_agnostic_preview = bool(
             pump_chop_sign_agnostic_preview
         )
+        self.pump_chop_tail_heuristic_enable = bool(
+            pump_chop_tail_heuristic_enable
+        )
+        self.pump_chop_tail_heuristic_start = int(pump_chop_tail_heuristic_start)
+        self.pump_chop_tail_heuristic_stop = int(pump_chop_tail_heuristic_stop)
+        self.pump_chop_tail_heuristic_expected_sign = float(
+            pump_chop_tail_heuristic_expected_sign
+        )
+        self.pump_chop_tail_heuristic_zero_baseline = bool(
+            pump_chop_tail_heuristic_zero_baseline
+        )
+        self.reference_processing_mode = str(reference_processing_mode).strip().lower()
+        if self.reference_processing_mode not in ("difference", "ratio"):
+            raise ValueError(
+                "reference_processing_mode must be 'difference' or 'ratio'."
+            )
+        self.reference_ratio_floor = max(1e-12, float(reference_ratio_floor))
+        self.channel_dark_main_offset = None
+        self.channel_dark_ref_offset = None
+        self.pump_chop_dark_offset = None
         self.capture_hit_rate_enable = bool(capture_hit_rate_enable)
         self.capture_hit_rate_window_lines = max(
             16, int(capture_hit_rate_window_lines)
@@ -1417,10 +1869,17 @@ class _LiveLineAccumulator:
         self.chop_parity_reset_counter = 0
         self.chop_preview_template = None
         self.chop_parity_warned = False
+        self.tail_guided_flip_counter = 0
+        self.tail_guided_last_mean = float("nan")
         self._pending_parity_reset = False
         self._pending_parity_reset_reason = ""
         self.last_warning_message = None
         self._reset_size(int(initial_size))
+        self.set_channel_dark_offsets(
+            channel_dark_main_offset,
+            channel_dark_ref_offset,
+        )
+        self.set_pump_chop_dark_offset(pump_chop_dark_offset)
 
     def _reset_size(self, size):
         size = max(1, int(size))
@@ -1433,8 +1892,14 @@ class _LiveLineAccumulator:
         self.chop_phase1_buffer = deque(maxlen=self.integration_line_count)
         self.chop_phase0_sum = np.zeros(size, dtype=float)
         self.chop_phase1_sum = np.zeros(size, dtype=float)
+        self.chop_ref_phase0_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_ref_phase1_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_ref_phase0_sum = np.zeros(size, dtype=float)
+        self.chop_ref_phase1_sum = np.zeros(size, dtype=float)
         self.chop_pair_buffer = deque(maxlen=self.integration_line_count)
         self.chop_pair_sum = np.zeros(size, dtype=float)
+        self.chop_pair_dark_corrected_buffer = deque(maxlen=self.integration_line_count)
+        self.chop_pair_dark_corrected_sum = np.zeros(size, dtype=float)
         self.latest_line = np.zeros(size, dtype=float)
         self.integrated_line = np.zeros(size, dtype=float)
         self.ref_line = None
@@ -1443,6 +1908,9 @@ class _LiveLineAccumulator:
         self.diff_integrated_line = None
         self.latest_chop_pair = None
         self.latest_chop_integrated = None
+        self.latest_chop_integrated_pairwise_dark_corrected = None
+        self.latest_chop_main_diagnostic = None
+        self.latest_chop_ref_diagnostic = None
         self.integrated_auc_main = float("nan")
         self.integrated_auc_ref = float("nan")
         self.integrated_auc_diff = float("nan")
@@ -1459,10 +1927,297 @@ class _LiveLineAccumulator:
         self.chop_parity_reset_counter = 0
         self.chop_preview_template = None
         self.demod_last_line_phase = None
+        self.tail_guided_flip_counter = 0
+        self.tail_guided_last_mean = float("nan")
+        if self.channel_dark_main_offset is not None and self.channel_dark_main_offset.size != size:
+            self.channel_dark_main_offset = None
+        if self.channel_dark_ref_offset is not None and self.channel_dark_ref_offset.size != size:
+            self.channel_dark_ref_offset = None
+        if self.pump_chop_dark_offset is not None and self.pump_chop_dark_offset.size != size:
+            self.pump_chop_dark_offset = None
+
+    def _reference_ratio(self, numerator, denominator):
+        numerator = np.asarray(numerator, dtype=float)
+        denominator = np.asarray(denominator, dtype=float)
+        safe_den = denominator.copy()
+        small_mask = np.abs(safe_den) < self.reference_ratio_floor
+        if np.any(small_mask):
+            safe_den[small_mask] = np.where(
+                safe_den[small_mask] < 0.0,
+                -self.reference_ratio_floor,
+                self.reference_ratio_floor,
+            )
+        ratio = np.divide(numerator, safe_den, out=np.zeros_like(numerator), where=np.isfinite(safe_den))
+        ratio[~np.isfinite(ratio)] = 0.0
+        return ratio
+
+    def _safe_positive_ratio(self, numerator, denominator):
+        ratio = self._reference_ratio(numerator, denominator)
+        return np.maximum(ratio, self.reference_ratio_floor)
+
+    def _compute_delta_od(self, pumped_ratio, unpumped_ratio):
+        pumped_safe = np.maximum(np.asarray(pumped_ratio, dtype=float), self.reference_ratio_floor)
+        unpumped_safe = np.maximum(np.asarray(unpumped_ratio, dtype=float), self.reference_ratio_floor)
+        return -np.log10(np.divide(pumped_safe, unpumped_safe))
+
+    def _compute_single_channel_delta_od(self, pumped_signal, unpumped_signal, dark_offset):
+        pumped = self._apply_channel_dark(pumped_signal, dark_offset)
+        unpumped = self._apply_channel_dark(unpumped_signal, dark_offset)
+        if pumped is None or unpumped is None:
+            return None
+        pumped_safe = np.asarray(pumped, dtype=float)
+        unpumped_safe = np.asarray(unpumped, dtype=float)
+        valid = (
+            np.isfinite(pumped_safe)
+            & np.isfinite(unpumped_safe)
+            & (pumped_safe > self.reference_ratio_floor)
+            & (unpumped_safe > self.reference_ratio_floor)
+        )
+        ratio = np.divide(
+            pumped_safe,
+            unpumped_safe,
+            out=np.ones_like(pumped_safe),
+            where=valid,
+        )
+        valid &= np.isfinite(ratio) & (ratio > 0.0)
+        out = np.full(pumped_safe.shape, np.nan, dtype=float)
+        out[valid] = -np.log10(ratio[valid])
+        return out
+
+    def _referenced_phase_diagnostics(self):
+        self.latest_chop_main_diagnostic = None
+        self.latest_chop_ref_diagnostic = None
+        if not (
+            self.reference_processing_mode == "ratio"
+            and self.ref_line is not None
+            and len(self.chop_phase0_buffer) > 0
+            and len(self.chop_phase1_buffer) > 0
+            and len(self.chop_ref_phase0_buffer) > 0
+            and len(self.chop_ref_phase1_buffer) > 0
+        ):
+            return None
+
+        phase0_main_mean = self.chop_phase0_sum / float(len(self.chop_phase0_buffer))
+        phase1_main_mean = self.chop_phase1_sum / float(len(self.chop_phase1_buffer))
+        phase0_ref_mean = self.chop_ref_phase0_sum / float(len(self.chop_ref_phase0_buffer))
+        phase1_ref_mean = self.chop_ref_phase1_sum / float(len(self.chop_ref_phase1_buffer))
+
+        if self.pump_chop_sign > 0:
+            pumped_main = phase1_main_mean
+            unpumped_main = phase0_main_mean
+            pumped_ref = phase1_ref_mean
+            unpumped_ref = phase0_ref_mean
+        else:
+            pumped_main = phase0_main_mean
+            unpumped_main = phase1_main_mean
+            pumped_ref = phase0_ref_mean
+            unpumped_ref = phase1_ref_mean
+
+        self.latest_chop_main_diagnostic = self._compute_single_channel_delta_od(
+            pumped_main,
+            unpumped_main,
+            self.channel_dark_main_offset,
+        )
+        self.latest_chop_ref_diagnostic = self._compute_single_channel_delta_od(
+            pumped_ref,
+            unpumped_ref,
+            self.channel_dark_ref_offset,
+        )
+
+        pumped_ratio = self._safe_positive_ratio(
+            self._apply_channel_dark(pumped_main, self.channel_dark_main_offset),
+            self._apply_channel_dark(pumped_ref, self.channel_dark_ref_offset),
+        )
+        unpumped_ratio = self._safe_positive_ratio(
+            self._apply_channel_dark(unpumped_main, self.channel_dark_main_offset),
+            self._apply_channel_dark(unpumped_ref, self.channel_dark_ref_offset),
+        )
+        return self._compute_delta_od(pumped_ratio, unpumped_ratio)
+
+    def set_channel_dark_offsets(self, main_offset=None, ref_offset=None):
+        if main_offset is None:
+            self.channel_dark_main_offset = None
+        else:
+            arr = np.asarray(main_offset, dtype=float).copy()
+            if arr.size != self.size:
+                raise ValueError(
+                    f"main channel dark size mismatch ({arr.size} != {self.size})"
+                )
+            self.channel_dark_main_offset = arr
+        if ref_offset is None:
+            self.channel_dark_ref_offset = None
+        else:
+            arr = np.asarray(ref_offset, dtype=float).copy()
+            if arr.size != self.size:
+                raise ValueError(
+                    f"reference channel dark size mismatch ({arr.size} != {self.size})"
+                )
+            self.channel_dark_ref_offset = arr
+
+    def set_pump_chop_dark_offset(self, dark_offset=None):
+        if dark_offset is None:
+            self.pump_chop_dark_offset = None
+        else:
+            arr = np.asarray(dark_offset, dtype=float).copy()
+            if arr.size != self.size:
+                raise ValueError(
+                    f"pump-chop dark size mismatch ({arr.size} != {self.size})"
+                )
+            self.pump_chop_dark_offset = arr
+        self.chop_pair_dark_corrected_buffer.clear()
+        self.chop_pair_dark_corrected_sum = np.zeros(self.size, dtype=float)
+        self.latest_chop_integrated_pairwise_dark_corrected = None
+
+    def _apply_channel_dark(self, line, dark_offset):
+        if line is None:
+            return None
+        arr = np.asarray(line, dtype=float)
+        if dark_offset is None:
+            return arr.copy()
+        return arr - dark_offset
+
+    def _corrected_main_line(self, line=None):
+        src = self.latest_line if line is None else line
+        return self._apply_channel_dark(src, self.channel_dark_main_offset)
+
+    def _corrected_ref_line(self, line=None):
+        if self.ref_line is None and line is None:
+            return None
+        src = self.ref_line if line is None else line
+        return self._apply_channel_dark(src, self.channel_dark_ref_offset)
+
+    def _demod_source_line(self):
+        if self.reference_processing_mode == "ratio" and self.diff_line is not None:
+            return self.diff_line
+        return self.latest_line
 
     def request_parity_reset(self, reason):
         self._pending_parity_reset = True
         self._pending_parity_reset_reason = str(reason)
+
+    def set_pump_chop_sign(self, sign):
+        """Update demod sign live without throwing away accumulated state."""
+        sign = float(sign)
+        if sign == 0.0:
+            raise ValueError("pump_chop_sign must be non-zero.")
+        old_sign = float(self.pump_chop_sign)
+        if sign == old_sign:
+            return
+        ratio = sign / old_sign
+        self.pump_chop_sign = sign
+        if self.latest_chop_pair is not None:
+            self.latest_chop_pair = self.latest_chop_pair * ratio
+        if self.latest_chop_integrated is not None:
+            self.latest_chop_integrated = self.latest_chop_integrated * ratio
+        if self.latest_chop_integrated_pairwise_dark_corrected is not None:
+            self.latest_chop_integrated_pairwise_dark_corrected = (
+                self.latest_chop_integrated_pairwise_dark_corrected * ratio
+            )
+        if self.latest_chop_main_diagnostic is not None:
+            self.latest_chop_main_diagnostic = self.latest_chop_main_diagnostic * ratio
+        if self.latest_chop_ref_diagnostic is not None:
+            self.latest_chop_ref_diagnostic = self.latest_chop_ref_diagnostic * ratio
+        if self.pump_chop_dark_offset is not None:
+            self.pump_chop_dark_offset = self.pump_chop_dark_offset * ratio
+        if self.pump_chop_use_adjacent_pairs or self.pump_chop_tail_heuristic_enable:
+            self.chop_pair_buffer = deque(
+                (pair * ratio for pair in self.chop_pair_buffer),
+                maxlen=self.chop_pair_buffer.maxlen,
+            )
+            self.chop_pair_sum = self.chop_pair_sum * ratio
+            if self.chop_preview_template is not None:
+                self.chop_preview_template = self.chop_preview_template * ratio
+        if len(self.chop_pair_dark_corrected_buffer) > 0:
+            self.chop_pair_dark_corrected_buffer = deque(
+                (pair * ratio for pair in self.chop_pair_dark_corrected_buffer),
+                maxlen=self.chop_pair_dark_corrected_buffer.maxlen,
+            )
+            self.chop_pair_dark_corrected_sum = (
+                self.chop_pair_dark_corrected_sum * ratio
+            )
+
+    def _update_pairwise_dark_corrected_referenced(self, chop_pair):
+        if not (
+            self.reference_processing_mode == "ratio"
+            and self.pump_chop_dark_offset is not None
+        ):
+            return
+        pair = np.asarray(chop_pair, dtype=float)
+        if self.pump_chop_dark_offset.size != pair.size:
+            return
+        corrected = pair - self.pump_chop_dark_offset
+        if len(self.chop_pair_dark_corrected_buffer) == self.chop_pair_dark_corrected_buffer.maxlen:
+            self.chop_pair_dark_corrected_sum -= self.chop_pair_dark_corrected_buffer.popleft()
+        self.chop_pair_dark_corrected_buffer.append(corrected.copy())
+        self.chop_pair_dark_corrected_sum += corrected
+        self.latest_chop_integrated_pairwise_dark_corrected = (
+            self.chop_pair_dark_corrected_sum
+            / float(len(self.chop_pair_dark_corrected_buffer))
+        )
+
+    def _tail_guided_pair(self, raw_pair):
+        pair = np.asarray(raw_pair, dtype=float).copy()
+        if not self.pump_chop_tail_heuristic_enable:
+            return self.pump_chop_sign * pair
+
+        start = max(0, min(self.size - 1, int(self.pump_chop_tail_heuristic_start)))
+        stop = max(start + 1, min(self.size, int(self.pump_chop_tail_heuristic_stop)))
+        tail = pair[start:stop]
+        if tail.size <= 0:
+            return self.pump_chop_sign * pair
+
+        tail_mean = float(np.mean(tail))
+        if np.isfinite(tail_mean):
+            if (
+                self.pump_chop_tail_heuristic_expected_sign != 0.0
+                and tail_mean * self.pump_chop_tail_heuristic_expected_sign < 0.0
+            ):
+                pair = -pair
+                tail_mean = -tail_mean
+                self.tail_guided_flip_counter += 1
+            self.tail_guided_last_mean = tail_mean
+            if self.pump_chop_tail_heuristic_zero_baseline:
+                pair = pair - tail_mean
+
+        return self.pump_chop_sign * pair
+
+    def _tail_guided_reference_delta_od(self, current_ratio, previous_ratio):
+        current = np.asarray(current_ratio, dtype=float)
+        previous = np.asarray(previous_ratio, dtype=float)
+        ratio_pair = current - previous
+
+        start = max(0, min(ratio_pair.size - 1, int(self.pump_chop_tail_heuristic_start)))
+        stop = max(start + 1, min(ratio_pair.size, int(self.pump_chop_tail_heuristic_stop)))
+        flip_pair = False
+        tail_mean = float("nan")
+
+        if self.pump_chop_tail_heuristic_enable:
+            tail = ratio_pair[start:stop]
+            if tail.size > 0:
+                tail_mean = float(np.mean(tail))
+                if np.isfinite(tail_mean):
+                    if (
+                        self.pump_chop_tail_heuristic_expected_sign != 0.0
+                        and tail_mean * self.pump_chop_tail_heuristic_expected_sign < 0.0
+                    ):
+                        flip_pair = True
+                        tail_mean = -tail_mean
+                        self.tail_guided_flip_counter += 1
+                    self.tail_guided_last_mean = tail_mean
+
+        delta_od = self._compute_delta_od(current, previous)
+        if flip_pair:
+            delta_od = -delta_od
+        delta_od = self.pump_chop_sign * delta_od
+
+        if self.pump_chop_tail_heuristic_enable and self.pump_chop_tail_heuristic_zero_baseline:
+            tail = delta_od[start:stop]
+            if tail.size > 0:
+                finite_tail = tail[np.isfinite(tail)]
+                if finite_tail.size > 0:
+                    delta_od = delta_od - float(np.mean(finite_tail))
+
+        return delta_od
 
     def _apply_parity_reset(self, reason):
         self.chop_phase = 0
@@ -1473,10 +2228,19 @@ class _LiveLineAccumulator:
         self.chop_phase1_buffer.clear()
         self.chop_phase0_sum = np.zeros(self.size, dtype=float)
         self.chop_phase1_sum = np.zeros(self.size, dtype=float)
+        self.chop_ref_phase0_buffer.clear()
+        self.chop_ref_phase1_buffer.clear()
+        self.chop_ref_phase0_sum = np.zeros(self.size, dtype=float)
+        self.chop_ref_phase1_sum = np.zeros(self.size, dtype=float)
         self.chop_pair_buffer.clear()
         self.chop_pair_sum = np.zeros(self.size, dtype=float)
+        self.chop_pair_dark_corrected_buffer.clear()
+        self.chop_pair_dark_corrected_sum = np.zeros(self.size, dtype=float)
         self.latest_chop_pair = None
         self.latest_chop_integrated = None
+        self.latest_chop_integrated_pairwise_dark_corrected = None
+        self.latest_chop_main_diagnostic = None
+        self.latest_chop_ref_diagnostic = None
         self.chop_preview_template = None
         self.chop_parity_reset_counter += 1
         if not self.chop_parity_warned:
@@ -1493,6 +2257,7 @@ class _LiveLineAccumulator:
         lines_consumed=1,
         demod_qual_active=False,
         edge_delta_since_last_line=None,
+        external_phase_state=None,
     ):
         self.last_warning_message = None
         line = np.asarray(line, dtype=float)
@@ -1519,10 +2284,25 @@ class _LiveLineAccumulator:
             self.ref_integrated_line = (
                 self.ref_integration_sum / float(len(self.ref_line_buffer))
             )
-            self.diff_line = self.latest_line - self.ref_line
-            self.diff_integrated_line = (
-                self.integrated_line - self.ref_integrated_line
-            )
+            if self.reference_processing_mode == "ratio":
+                corrected_main = self._corrected_main_line(self.latest_line)
+                corrected_ref = self._corrected_ref_line(self.ref_line)
+                corrected_integrated_main = self._corrected_main_line(
+                    self.integrated_line
+                )
+                corrected_integrated_ref = self._corrected_ref_line(
+                    self.ref_integrated_line
+                )
+                self.diff_line = self._reference_ratio(corrected_main, corrected_ref)
+                self.diff_integrated_line = self._reference_ratio(
+                    corrected_integrated_main,
+                    corrected_integrated_ref,
+                )
+            else:
+                self.diff_line = self.latest_line - self.ref_line
+                self.diff_integrated_line = (
+                    self.integrated_line - self.ref_integrated_line
+                )
         else:
             self.ref_integrated_line = None
             self.diff_line = None
@@ -1559,6 +2339,8 @@ class _LiveLineAccumulator:
         if not self.pump_chop_demod:
             return
 
+        demod_line = self._demod_source_line()
+
         parity_reset_needed = False
         local_reset_reason = ""
         if self._pending_parity_reset:
@@ -1569,7 +2351,18 @@ class _LiveLineAccumulator:
 
         demod_line_accepted = True
         demod_line_phase = None
-        if demod_qual_active:
+        if self.pump_chop_phase_source == "chopper_input":
+            if external_phase_state is None:
+                demod_line_accepted = False
+                self.demod_reject_count += 1
+                self.demod_reject_missing_count += 1
+                parity_reset_needed = True
+                local_reset_reason = "missing chopper-input phase label"
+            else:
+                demod_line_phase = int(bool(external_phase_state))
+                self.demod_accept_count += 1
+                self.demod_last_line_phase = demod_line_phase
+        elif demod_qual_active:
             if edge_delta_since_last_line is None:
                 if self.demod_last_line_phase is None:
                     demod_line_phase = 0
@@ -1614,16 +2407,23 @@ class _LiveLineAccumulator:
         if self.pump_chop_use_adjacent_pairs:
             if self.pump_chop_sign_agnostic_preview:
                 if self.chop_prev_line is None:
-                    self.chop_prev_line = self.latest_line.copy()
+                    self.chop_prev_line = demod_line.copy()
                     self.latest_chop_pair = None
                     self.latest_chop_integrated = None
                 else:
-                    chop_pair = self.pump_chop_sign * (
-                        self.latest_line - self.chop_prev_line
-                    )
+                    if self.reference_processing_mode == "ratio" and self.ref_line is not None:
+                        chop_pair = self._tail_guided_reference_delta_od(
+                            demod_line,
+                            self.chop_prev_line,
+                        )
+                    else:
+                        chop_pair = self._tail_guided_pair(
+                            demod_line - self.chop_prev_line
+                        )
                     if (
                         self.chop_preview_template is not None
                         and np.any(np.isfinite(self.chop_preview_template))
+                        and not self.pump_chop_tail_heuristic_enable
                     ):
                         template_dot = float(
                             np.dot(chop_pair, self.chop_preview_template)
@@ -1633,6 +2433,7 @@ class _LiveLineAccumulator:
                             self.chop_preview_flip_counter += 1
                     self.chop_pair_counter += 1
                     self.latest_chop_pair = chop_pair
+                    self._update_pairwise_dark_corrected_referenced(chop_pair)
                     if len(self.chop_pair_buffer) == self.chop_pair_buffer.maxlen:
                         self.chop_pair_sum -= self.chop_pair_buffer.popleft()
                     self.chop_pair_buffer.append(chop_pair.copy())
@@ -1641,7 +2442,7 @@ class _LiveLineAccumulator:
                         len(self.chop_pair_buffer)
                     )
                     self.chop_preview_template = self.latest_chop_integrated.copy()
-                    self.chop_prev_line = self.latest_line.copy()
+                    self.chop_prev_line = demod_line.copy()
             else:
                 if demod_qual_active:
                     current_phase = int(
@@ -1651,7 +2452,7 @@ class _LiveLineAccumulator:
                     current_phase = int(self.chop_phase ^ ((lines_consumed - 1) & 1))
                     self.chop_phase = int(self.chop_phase ^ (lines_consumed & 1))
                 if self.chop_prev_line is None:
-                    self.chop_prev_line = self.latest_line.copy()
+                    self.chop_prev_line = demod_line.copy()
                     self.chop_prev_phase = current_phase
                     self.latest_chop_pair = None
                     self.latest_chop_integrated = None
@@ -1661,11 +2462,18 @@ class _LiveLineAccumulator:
                         or (current_phase != self.chop_prev_phase)
                     )
                     if make_pair:
-                        chop_pair = self.pump_chop_sign * (
-                            self.latest_line - self.chop_prev_line
-                        )
+                        if self.reference_processing_mode == "ratio" and self.ref_line is not None:
+                            chop_pair = self._tail_guided_reference_delta_od(
+                                demod_line,
+                                self.chop_prev_line,
+                            )
+                        else:
+                            chop_pair = self._tail_guided_pair(
+                                demod_line - self.chop_prev_line
+                            )
                         self.chop_pair_counter += 1
                         self.latest_chop_pair = chop_pair
+                        self._update_pairwise_dark_corrected_referenced(chop_pair)
                         if len(self.chop_pair_buffer) == self.chop_pair_buffer.maxlen:
                             self.chop_pair_sum -= self.chop_pair_buffer.popleft()
                         self.chop_pair_buffer.append(chop_pair.copy())
@@ -1675,8 +2483,8 @@ class _LiveLineAccumulator:
                         )
                     else:
                         self.latest_chop_pair = None
-                    self.chop_prev_line = self.latest_line.copy()
-                    self.chop_prev_phase = current_phase
+                        self.chop_prev_line = demod_line.copy()
+                        self.chop_prev_phase = current_phase
             return
 
         if demod_qual_active:
@@ -1690,14 +2498,24 @@ class _LiveLineAccumulator:
                 self.chop_phase0_sum -= self.chop_phase0_buffer.popleft()
             self.chop_phase0_buffer.append(self.latest_line.copy())
             self.chop_phase0_sum += self.latest_line
+            if self.reference_processing_mode == "ratio" and self.ref_line is not None:
+                if len(self.chop_ref_phase0_buffer) == self.chop_ref_phase0_buffer.maxlen:
+                    self.chop_ref_phase0_sum -= self.chop_ref_phase0_buffer.popleft()
+                self.chop_ref_phase0_buffer.append(self.ref_line.copy())
+                self.chop_ref_phase0_sum += self.ref_line
         else:
             if len(self.chop_phase1_buffer) == self.chop_phase1_buffer.maxlen:
                 self.chop_phase1_sum -= self.chop_phase1_buffer.popleft()
             self.chop_phase1_buffer.append(self.latest_line.copy())
             self.chop_phase1_sum += self.latest_line
+            if self.reference_processing_mode == "ratio" and self.ref_line is not None:
+                if len(self.chop_ref_phase1_buffer) == self.chop_ref_phase1_buffer.maxlen:
+                    self.chop_ref_phase1_sum -= self.chop_ref_phase1_buffer.popleft()
+                self.chop_ref_phase1_buffer.append(self.ref_line.copy())
+                self.chop_ref_phase1_sum += self.ref_line
 
         if self.chop_prev_line is None:
-            self.chop_prev_line = self.latest_line.copy()
+            self.chop_prev_line = demod_line.copy()
             self.chop_prev_phase = current_phase
             self.latest_chop_pair = None
         else:
@@ -1706,17 +2524,56 @@ class _LiveLineAccumulator:
                 or (current_phase != self.chop_prev_phase)
             )
             if make_pair:
-                chop_pair = self.pump_chop_sign * (
-                    self.latest_line - self.chop_prev_line
-                )
+                if (
+                    self.reference_processing_mode == "ratio"
+                    and self.ref_line is not None
+                    and self.pump_chop_tail_heuristic_enable
+                ):
+                    chop_pair = self._tail_guided_reference_delta_od(
+                        demod_line,
+                        self.chop_prev_line,
+                    )
+                elif self.reference_processing_mode == "ratio" and self.ref_line is not None:
+                    pumped_phase = 1 if self.pump_chop_sign > 0 else 0
+                    if current_phase == pumped_phase:
+                        pumped_ratio = demod_line
+                        unpumped_ratio = self.chop_prev_line
+                    else:
+                        pumped_ratio = self.chop_prev_line
+                        unpumped_ratio = demod_line
+                    chop_pair = self._compute_delta_od(
+                        pumped_ratio,
+                        unpumped_ratio,
+                    )
+                else:
+                    chop_pair = self._tail_guided_pair(
+                        demod_line - self.chop_prev_line
+                    )
                 self.chop_pair_counter += 1
                 self.latest_chop_pair = chop_pair
+                self._update_pairwise_dark_corrected_referenced(chop_pair)
+                if self.pump_chop_tail_heuristic_enable:
+                    if len(self.chop_pair_buffer) == self.chop_pair_buffer.maxlen:
+                        self.chop_pair_sum -= self.chop_pair_buffer.popleft()
+                    self.chop_pair_buffer.append(chop_pair.copy())
+                    self.chop_pair_sum += chop_pair
             else:
                 self.latest_chop_pair = None
-            self.chop_prev_line = self.latest_line.copy()
+            self.chop_prev_line = demod_line.copy()
             self.chop_prev_phase = current_phase
 
-        if len(self.chop_phase0_buffer) > 0 and len(self.chop_phase1_buffer) > 0:
+        referenced_phase_delta_od = self._referenced_phase_diagnostics()
+
+        if self.pump_chop_tail_heuristic_enable:
+            if len(self.chop_pair_buffer) > 0:
+                self.latest_chop_integrated = self.chop_pair_sum / float(
+                    len(self.chop_pair_buffer)
+                )
+            else:
+                self.latest_chop_integrated = None
+        elif referenced_phase_delta_od is not None:
+            self.latest_chop_integrated = referenced_phase_delta_od
+        elif len(self.chop_phase0_buffer) > 0 and len(self.chop_phase1_buffer) > 0:
             phase0_mean = self.chop_phase0_sum / float(len(self.chop_phase0_buffer))
             phase1_mean = self.chop_phase1_sum / float(len(self.chop_phase1_buffer))
             self.latest_chop_integrated = self.pump_chop_sign * (
@@ -1750,6 +2607,21 @@ class _LiveLineAccumulator:
                 if self.latest_chop_integrated is None
                 else self.latest_chop_integrated.copy()
             ),
+            "latest_chop_integrated_pairwise_dark_corrected": (
+                None
+                if self.latest_chop_integrated_pairwise_dark_corrected is None
+                else self.latest_chop_integrated_pairwise_dark_corrected.copy()
+            ),
+            "latest_chop_main_diagnostic": (
+                None
+                if self.latest_chop_main_diagnostic is None
+                else self.latest_chop_main_diagnostic.copy()
+            ),
+            "latest_chop_ref_diagnostic": (
+                None
+                if self.latest_chop_ref_diagnostic is None
+                else self.latest_chop_ref_diagnostic.copy()
+            ),
             "integrated_auc_main": float(self.integrated_auc_main),
             "integrated_auc_ref": float(self.integrated_auc_ref),
             "integrated_auc_diff": float(self.integrated_auc_diff),
@@ -1763,6 +2635,8 @@ class _LiveLineAccumulator:
             "pair_buffer_len": int(len(self.chop_pair_buffer)),
             "chop_pair_counter": int(self.chop_pair_counter),
             "chop_preview_flip_counter": int(self.chop_preview_flip_counter),
+            "tail_guided_flip_counter": int(self.tail_guided_flip_counter),
+            "tail_guided_last_mean": float(self.tail_guided_last_mean),
             "chop_parity_reset_counter": int(self.chop_parity_reset_counter),
             "demod_accept_count": int(self.demod_accept_count),
             "demod_reject_count": int(self.demod_reject_count),
@@ -1837,26 +2711,44 @@ class _BackgroundAccumulatorProcessor:
                     self._error = exc
                 return
             elapsed_s = max(1e-9, time.perf_counter() - t0)
-            consumed = max(1, int(lines_consumed))
-            if self.read_reference:
-                if not (isinstance(data, dict) and "main" in data and "reference" in data):
-                    with self._lock:
-                        self._error = RuntimeError(
-                            "Expected {'main','reference'} data in background processor."
+            data_items = data if isinstance(data, list) else [data]
+            consumed = max(1, len(data_items))
+            for item in data_items:
+                external_phase_state = None
+                if self.read_reference:
+                    if not (
+                        isinstance(item, dict)
+                        and "main" in item
+                        and "reference" in item
+                    ):
+                        with self._lock:
+                            self._error = RuntimeError(
+                                "Expected {'main','reference'} data in background processor."
+                            )
+                        return
+                    line = np.asarray(item["main"], dtype=float)
+                    ref_line = np.asarray(item["reference"], dtype=float)
+                    external_phase_state = item.get("_phase_state")
+                else:
+                    if isinstance(item, dict) and "main" in item:
+                        line = np.asarray(item["main"], dtype=float)
+                        ref_line = (
+                            None
+                            if item.get("reference") is None
+                            else np.asarray(item["reference"], dtype=float)
                         )
-                    return
-                line = np.asarray(data["main"], dtype=float)
-                ref_line = np.asarray(data["reference"], dtype=float)
-            else:
-                line = np.asarray(data, dtype=float)
-                ref_line = None
-            self.accumulator.process_line(
-                line,
-                ref_line=ref_line,
-                lines_consumed=consumed,
-                demod_qual_active=False,
-                edge_delta_since_last_line=None,
-            )
+                        external_phase_state = item.get("_phase_state")
+                    else:
+                        line = np.asarray(item, dtype=float)
+                        ref_line = None
+                self.accumulator.process_line(
+                    line,
+                    ref_line=ref_line,
+                    lines_consumed=1,
+                    demod_qual_active=False,
+                    edge_delta_since_last_line=None,
+                    external_phase_state=external_phase_state,
+                )
             self._line_rate_buffer.append(consumed / elapsed_s)
             now = time.perf_counter()
             if self._wall_start_t is None:
@@ -1886,6 +2778,17 @@ def _is_daq_buffer_overwrite_error(exc):
         return True
     text = str(exc).lower()
     return ("-200222" in text) or ("input buffer overwrite" in text)
+
+
+def _is_daq_timeout_error(exc):
+    """Return True if an exception corresponds to an NI-DAQmx read timeout (-200284)."""
+    code = getattr(exc, "error_code", None)
+    if code == -200284:
+        return True
+    text = str(exc).lower()
+    return ("-200284" in text) or (
+        "some or all of the samples requested have not yet been acquired" in text
+    )
 
 
 def _metric_score(auc_median, auc_std, trigger_eff, valid):
@@ -2347,12 +3250,24 @@ def run_live_plot(
     integration_line_count=128,
     plot_raw_line=True,
     live_video_mode="main",
+    reference_processing_mode="difference",
+    reference_ratio_floor=1e-6,
+    channel_dark_subtract=False,
+    channel_dark_file=None,
     pump_chop_demod=False,
     pump_chop_sign=-1.0,
+    pump_chop_phase_source="inferred",
     pump_chop_use_adjacent_pairs=False,
     pump_chop_sign_agnostic_preview=False,
+    pump_chop_tail_heuristic_enable=False,
+    pump_chop_tail_heuristic_start=900,
+    pump_chop_tail_heuristic_stop=1000,
+    pump_chop_tail_heuristic_expected_sign=1.0,
+    pump_chop_tail_heuristic_zero_baseline=True,
     pump_chop_dark_subtract=True,
     pump_chop_dark_file=None,
+    pump_chop_display_mode="native",
+    pump_chop_mod_min_light_v=0.025,
     demod_trigger_qualified_acceptance=True,
     expected_trigger_hz=1000.0,
     acquisition_timeout_s=10.0,
@@ -2363,6 +3278,9 @@ def run_live_plot(
     monitor_pfi9=True,
     pfi9_monitor_counter="ctr2",
     pfi9_rate_gate_s=0.05,
+    monitor_chopper_input=False,
+    chopper_input_monitor_counter="ctr2",
+    chopper_input_rate_gate_s=0.05,
     trigger_plot_history=240,
     plot_target_fps=15.0,
     retrigger_latest_only_read=True,
@@ -2375,6 +3293,7 @@ def run_live_plot(
     decouple_acquisition_from_plot=True,
     persistent_ai_buffer_lines=256,
     reader_fifo_max_packets=256,
+    ordered_read_batch_lines=16,
     capture_hit_rate_enable=True,
     capture_hit_rate_window_lines=256,
     capture_hit_threshold_fraction=0.45,
@@ -2390,7 +3309,7 @@ def run_live_plot(
     - optional pump-chop demod diagnostics,
     - optional saved pump-dark baseline subtraction for integrated demod traces,
     - optional sign-agnostic adjacent-pair preview demod,
-    - optional PFI9 edge-rate monitoring.
+    - optional digital edge-rate monitoring for trigger or chopper input.
     """
     def _is_buffer_overwrite_error(exc):
         code = getattr(exc, "error_code", None)
@@ -2402,11 +3321,46 @@ def run_live_plot(
     mode_key = str(live_video_mode).strip().lower()
     if mode_key not in ("main", "ref", "both"):
         raise ValueError("live_video_mode must be 'main', 'ref', or 'both'.")
+    reference_processing_mode = str(reference_processing_mode).strip().lower()
+    if reference_processing_mode not in ("difference", "ratio"):
+        raise ValueError(
+            "reference_processing_mode must be 'difference' or 'ratio'."
+        )
+    reference_ratio_floor = max(1e-12, float(reference_ratio_floor))
+    channel_dark_subtract = bool(channel_dark_subtract)
     pump_chop_demod = bool(pump_chop_demod)
     pump_chop_sign = float(pump_chop_sign)
+    pump_chop_phase_source = str(pump_chop_phase_source).strip().lower()
+    if pump_chop_phase_source not in ("inferred", "chopper_input"):
+        raise ValueError(
+            "pump_chop_phase_source must be 'inferred' or 'chopper_input'."
+        )
     pump_chop_use_adjacent_pairs = bool(pump_chop_use_adjacent_pairs)
     pump_chop_sign_agnostic_preview = bool(pump_chop_sign_agnostic_preview)
+    pump_chop_tail_heuristic_enable = bool(pump_chop_tail_heuristic_enable)
+    pump_chop_tail_heuristic_start = int(pump_chop_tail_heuristic_start)
+    pump_chop_tail_heuristic_stop = int(pump_chop_tail_heuristic_stop)
+    pump_chop_tail_heuristic_expected_sign = float(
+        pump_chop_tail_heuristic_expected_sign
+    )
+    pump_chop_tail_heuristic_zero_baseline = bool(
+        pump_chop_tail_heuristic_zero_baseline
+    )
+    tail_window_mapping_note = ""
     pump_chop_dark_subtract = bool(pump_chop_dark_subtract)
+    pump_chop_display_mode = str(pump_chop_display_mode).strip().lower()
+    if pump_chop_display_mode in ("mod", "milliod", "milli_od", "milli-od"):
+        pump_chop_display_mode = "milli_od"
+    elif pump_chop_display_mode in ("native", "raw"):
+        pump_chop_display_mode = "native"
+    else:
+        raise ValueError(
+            "pump_chop_display_mode must be 'native' or 'mod'/'milliod'."
+        )
+    pump_chop_mod_min_light_v = max(
+        reference_ratio_floor,
+        float(pump_chop_mod_min_light_v),
+    )
     demod_trigger_qualified_acceptance = bool(demod_trigger_qualified_acceptance)
     retrigger_latest_only_read = bool(retrigger_latest_only_read)
     retrigger_overwrite_unread = bool(retrigger_overwrite_unread)
@@ -2414,7 +3368,16 @@ def run_live_plot(
     decouple_acquisition_from_plot = bool(decouple_acquisition_from_plot)
     persistent_ai_buffer_lines = max(64, int(persistent_ai_buffer_lines))
     reader_fifo_max_packets = max(8, int(reader_fifo_max_packets))
+    ordered_read_batch_lines = max(1, int(ordered_read_batch_lines))
     plot_target_fps = max(1.0, float(plot_target_fps))
+    gui_poll_timeout_s = max(
+        0.02,
+        min(float(acquisition_timeout_s), 0.25),
+    )
+    background_read_timeout_s = max(
+        0.10,
+        min(float(acquisition_timeout_s), 0.50),
+    )
     capture_hit_rate_enable = bool(capture_hit_rate_enable)
     capture_hit_rate_window_lines = max(16, int(capture_hit_rate_window_lines))
     capture_hit_warmup_lines = max(8, int(capture_hit_warmup_lines))
@@ -2422,22 +3385,260 @@ def run_live_plot(
     capture_hit_threshold_fraction = min(
         1.0, max(0.0, capture_hit_threshold_fraction)
     )
-    demod_mode_label = (
-        "adjacent preview"
-        if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
-        else (
-            "adjacent pairs"
+    if pump_chop_phase_source == "chopper_input":
+        demod_mode_label = (
+            "chopper-input adjacent pairs"
             if pump_chop_use_adjacent_pairs
-            else "odd/even buckets"
+            else "chopper-input buckets"
         )
-    )
+    else:
+        demod_mode_label = (
+            "tail-guided pairs"
+            if pump_chop_tail_heuristic_enable
+            else (
+                "adjacent preview"
+                if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+                else (
+                    "adjacent pairs"
+                    if pump_chop_use_adjacent_pairs
+                    else "phase1-phase0 buckets"
+                )
+            )
+        )
     if pump_chop_sign == 0:
         raise ValueError("pump_chop_sign must be non-zero.")
     read_reference = mode_key == "both"
     ref_only = mode_key == "ref"
+    if reference_processing_mode == "ratio" and not read_reference:
+        raise ValueError(
+            "reference_processing_mode='ratio' requires live_video_mode='both'."
+        )
     pda._validate_scan_rate(num_ai_channels=(2 if read_reference else 1))
 
-    x = np.arange(pda.output_samples_per_line)
+    def _counter_name(counter_value):
+        return str(counter_value).replace("\\", "/").split("/")[-1].lower()
+
+    requested_pfi9_monitor = bool(monitor_pfi9)
+    requested_chopper_input_monitor = bool(monitor_chopper_input)
+    pfi9_monitor_counter_name = _counter_name(pfi9_monitor_counter)
+    chopper_input_monitor_counter_name = _counter_name(
+        chopper_input_monitor_counter
+    )
+    ai_clock_counter_name = _counter_name(pda.ai_sample_clock_counter)
+    chopper_sync_counter_name = _counter_name(pda.chopper_sync_counter)
+    if requested_chopper_input_monitor and (
+        pda.uses_separate_ai_sample_clock
+        and chopper_input_monitor_counter_name == ai_clock_counter_name
+    ):
+        print(
+            "Chopper-input monitor disabled: decimated acquisition uses "
+            f"{pda.ai_sample_clock_counter} for the AI sample clock."
+        )
+        requested_chopper_input_monitor = False
+    if requested_chopper_input_monitor and (
+        pda.chopper_sync_enable
+        and chopper_input_monitor_counter_name == chopper_sync_counter_name
+    ):
+        print(
+            "Chopper-input monitor disabled: chopper sync output already uses "
+            f"{pda.chopper_sync_counter}."
+        )
+        requested_chopper_input_monitor = False
+    if (
+        requested_pfi9_monitor
+        and requested_chopper_input_monitor
+        and pfi9_monitor_counter_name == chopper_input_monitor_counter_name
+    ):
+        print(
+            "PFI9 monitor disabled: chopper-input monitor is using "
+            f"{chopper_input_monitor_counter}."
+        )
+        requested_pfi9_monitor = False
+
+    rate_plot_enable = bool(
+        requested_pfi9_monitor or requested_chopper_input_monitor
+    )
+    rate_plot_is_pfi9 = bool(requested_pfi9_monitor)
+    rate_plot_is_chopper_input = bool(requested_chopper_input_monitor)
+    rate_plot_label = "PFI9 Edge Rate (Hz)"
+    rate_plot_ylabel = "PFI9 Hz"
+    rate_med_label = "PFI9 med"
+    rate_title_prefix = "pfi9"
+    if requested_pfi9_monitor and pda.uses_separate_ai_sample_clock:
+        if pfi9_monitor_counter_name == ai_clock_counter_name:
+            print(
+                "PFI9 monitor disabled: decimated acquisition uses "
+                f"{pda.ai_sample_clock_counter} for the AI sample clock. "
+                "Chopper sync on ctr3/PFI3 is unaffected. "
+                "The lower rate panel will show DAQ line rate instead."
+            )
+            requested_pfi9_monitor = False
+            rate_plot_enable = True
+            rate_plot_is_pfi9 = False
+            rate_plot_is_chopper_input = False
+            rate_plot_label = "DAQ Line Rate (Hz; PFI9 counter unavailable)"
+            rate_plot_ylabel = "Line Hz"
+            rate_med_label = "Line-rate med"
+            rate_title_prefix = "line"
+    if requested_chopper_input_monitor:
+        rate_plot_enable = True
+        rate_plot_is_pfi9 = False
+        rate_plot_is_chopper_input = True
+        rate_plot_label = "Chopper In Rate (Hz)"
+        rate_plot_ylabel = "Chopper Hz"
+        rate_med_label = "Chopper med"
+        rate_title_prefix = "chop_in"
+    if (
+        pump_chop_tail_heuristic_enable
+        and int(pda.ai_sample_clock_divisor) > 1
+    ):
+        divisor = float(pda.ai_sample_clock_divisor)
+        original_start = int(pump_chop_tail_heuristic_start)
+        original_stop = int(pump_chop_tail_heuristic_stop)
+        mapped_start = int(np.floor(original_start / divisor))
+        mapped_stop = int(np.ceil(original_stop / divisor))
+        mapped_start = max(0, min(int(pda.output_samples_per_line) - 1, mapped_start))
+        mapped_stop = max(
+            mapped_start + 1,
+            min(int(pda.output_samples_per_line), mapped_stop),
+        )
+        pump_chop_tail_heuristic_start = mapped_start
+        pump_chop_tail_heuristic_stop = mapped_stop
+        tail_window_mapping_note = (
+            f"detector-equiv [{original_start}:{original_stop}) -> "
+            f"acquired [{mapped_start}:{mapped_stop})"
+        )
+        print(
+            "Tail-guided window remapped for decimated sampling: "
+            f"{tail_window_mapping_note}."
+        )
+    derived_signal_label = (
+        "Main/Ref" if reference_processing_mode == "ratio" else "Main-Ref"
+    )
+    derived_signal_units = (
+        "arb." if reference_processing_mode == "ratio" else "V"
+    )
+    if pump_chop_display_mode == "milli_od":
+        chop_signal_units = "mOD"
+        chop_axis_label = "Delta OD (mOD)"
+    elif read_reference and reference_processing_mode == "ratio":
+        chop_signal_units = "OD"
+        chop_axis_label = "Delta OD (OD)"
+    else:
+        chop_signal_units = "V"
+        chop_axis_label = "Delta V (V)"
+
+    x = pda.output_sample_axis()
+    if channel_dark_file in (None, ""):
+        channel_dark_path = (
+            Path(__file__).resolve().parent
+            / "acquisition_results"
+            / "channel_dark_offset_latest.npz"
+        )
+    else:
+        channel_dark_path = Path(channel_dark_file).expanduser()
+    channel_dark_path.parent.mkdir(parents=True, exist_ok=True)
+    channel_dark_main_offset = None
+    channel_dark_ref_offset = None
+    channel_dark_label = (
+        "ChanDark"
+        if (read_reference and reference_processing_mode == "ratio")
+        else "IntensityDark"
+    )
+    channel_dark_status = (
+        "disabled"
+        if not channel_dark_subtract
+        else f"ready ({channel_dark_path.name})"
+    )
+
+    def _set_channel_dark_status(text):
+        nonlocal channel_dark_status
+        channel_dark_status = str(text)
+
+    def _save_channel_dark_offsets(main_trace, ref_trace=None):
+        main_trace = np.asarray(main_trace, dtype=float)
+        payload = {
+            "main_integrated": main_trace,
+            "sample_index": pda.output_sample_axis(main_trace.size),
+            "reference_processing_mode": np.asarray([reference_processing_mode]),
+            "dark_kind": np.asarray(
+                [
+                    "main_ref_channel_dark"
+                    if ref_trace is not None
+                    else "main_intensity_dark"
+                ]
+            ),
+            "timestamp": np.asarray([time.strftime("%Y-%m-%d %H:%M:%S")]),
+        }
+        if ref_trace is not None:
+            payload["reference_integrated"] = np.asarray(ref_trace, dtype=float)
+        np.savez(channel_dark_path, **payload)
+
+    def _load_channel_dark_offsets(print_message=True):
+        nonlocal channel_dark_main_offset, channel_dark_ref_offset
+        if not channel_dark_subtract:
+            channel_dark_main_offset = None
+            channel_dark_ref_offset = None
+            _set_channel_dark_status("disabled")
+            if print_message:
+                print("Intensity/channel dark subtraction is disabled; not loading dark.")
+            return False
+        if not channel_dark_path.exists():
+            channel_dark_main_offset = None
+            channel_dark_ref_offset = None
+            _set_channel_dark_status("missing")
+            if print_message:
+                print(
+                    "Channel-dark load skipped: file not found at "
+                    f"{channel_dark_path}"
+                )
+            return False
+        with np.load(channel_dark_path, allow_pickle=False) as npz_file:
+            need_reference = read_reference and reference_processing_mode == "ratio"
+            if "main_integrated" not in npz_file:
+                raise KeyError("main_integrated not present in dark file.")
+            if need_reference and "reference_integrated" not in npz_file:
+                raise KeyError(
+                    "reference_integrated not present in dark file; "
+                    "referenced detection needs a two-channel dark."
+                )
+            main_loaded = np.asarray(npz_file["main_integrated"], dtype=float)
+            ref_loaded = (
+                np.asarray(npz_file["reference_integrated"], dtype=float)
+                if need_reference
+                else None
+            )
+        ref_size_bad = ref_loaded is not None and ref_loaded.size != x.size
+        if main_loaded.size != x.size or ref_size_bad:
+            channel_dark_main_offset = None
+            channel_dark_ref_offset = None
+            ref_size = "none" if ref_loaded is None else str(ref_loaded.size)
+            _set_channel_dark_status(
+                f"size mismatch ({main_loaded.size}/{ref_size}!={x.size})"
+            )
+            if print_message:
+                print(
+                    "Intensity/channel dark load skipped: sample-count mismatch "
+                    f"({main_loaded.size}/{ref_size} vs current {x.size})."
+                )
+            return False
+        channel_dark_main_offset = main_loaded.copy()
+        channel_dark_ref_offset = None if ref_loaded is None else ref_loaded.copy()
+        _set_channel_dark_status(f"active ({channel_dark_path.name})")
+        if print_message:
+            if ref_loaded is None:
+                print(
+                    "Intensity dark loaded from "
+                    f"{channel_dark_path} and will be subtracted from Vavg "
+                    "only for main-only mOD display normalization."
+                )
+            else:
+                print(
+                    "Channel-dark offsets loaded from "
+                    f"{channel_dark_path} and will be subtracted from main/ref "
+                    "before referenced detection."
+                )
+        return True
     if pump_chop_dark_file in (None, ""):
         pump_chop_dark_path = (
             Path(__file__).resolve().parent
@@ -2448,6 +3649,8 @@ def run_live_plot(
         pump_chop_dark_path = Path(pump_chop_dark_file).expanduser()
     pump_chop_dark_path.parent.mkdir(parents=True, exist_ok=True)
     pump_chop_dark_offset = None
+    pump_chop_dark_main_diagnostic_offset = None
+    pump_chop_dark_ref_diagnostic_offset = None
     pump_chop_dark_status = (
         "disabled"
         if not pump_chop_dark_subtract
@@ -2458,27 +3661,44 @@ def run_live_plot(
         nonlocal pump_chop_dark_status
         pump_chop_dark_status = str(text)
 
-    def _save_pump_dark_offset(trace):
+    def _save_pump_dark_offset(trace, main_diagnostic_trace=None, ref_diagnostic_trace=None):
         trace = np.asarray(trace, dtype=float)
-        np.savez(
-            pump_chop_dark_path,
-            demod_integrated=trace,
-            sample_index=np.arange(trace.size, dtype=int),
-            pump_chop_sign=np.asarray([pump_chop_sign], dtype=float),
-            demod_mode=np.asarray([demod_mode_label]),
-            timestamp=np.asarray([time.strftime("%Y-%m-%d %H:%M:%S")]),
-        )
+        payload = {
+            "demod_integrated": trace,
+            "sample_index": pda.output_sample_axis(trace.size),
+            "pump_chop_sign": np.asarray([pump_chop_sign], dtype=float),
+            "demod_mode": np.asarray([demod_mode_label]),
+            "reference_processing_mode": np.asarray([reference_processing_mode]),
+            "timestamp": np.asarray([time.strftime("%Y-%m-%d %H:%M:%S")]),
+        }
+        if main_diagnostic_trace is not None:
+            payload["main_diagnostic_integrated"] = np.asarray(
+                main_diagnostic_trace,
+                dtype=float,
+            )
+        if ref_diagnostic_trace is not None:
+            payload["ref_diagnostic_integrated"] = np.asarray(
+                ref_diagnostic_trace,
+                dtype=float,
+            )
+        np.savez(pump_chop_dark_path, **payload)
 
     def _load_pump_dark_offset(print_message=True):
         nonlocal pump_chop_dark_offset
+        nonlocal pump_chop_dark_main_diagnostic_offset
+        nonlocal pump_chop_dark_ref_diagnostic_offset
         if not pump_chop_dark_subtract:
             pump_chop_dark_offset = None
+            pump_chop_dark_main_diagnostic_offset = None
+            pump_chop_dark_ref_diagnostic_offset = None
             _set_pump_dark_status("disabled")
             if print_message:
                 print("Pump-dark subtraction is disabled; not loading dark offset.")
             return False
         if not pump_chop_dark_path.exists():
             pump_chop_dark_offset = None
+            pump_chop_dark_main_diagnostic_offset = None
+            pump_chop_dark_ref_diagnostic_offset = None
             _set_pump_dark_status("missing")
             if print_message:
                 print(
@@ -2490,8 +3710,20 @@ def run_live_plot(
             if "demod_integrated" not in npz_file:
                 raise KeyError("demod_integrated not present in pump-dark file.")
             loaded = np.asarray(npz_file["demod_integrated"], dtype=float)
+            loaded_main_diag = (
+                np.asarray(npz_file["main_diagnostic_integrated"], dtype=float)
+                if "main_diagnostic_integrated" in npz_file
+                else None
+            )
+            loaded_ref_diag = (
+                np.asarray(npz_file["ref_diagnostic_integrated"], dtype=float)
+                if "ref_diagnostic_integrated" in npz_file
+                else None
+            )
         if loaded.size != x.size:
             pump_chop_dark_offset = None
+            pump_chop_dark_main_diagnostic_offset = None
+            pump_chop_dark_ref_diagnostic_offset = None
             _set_pump_dark_status(f"size mismatch ({loaded.size}!={x.size})")
             if print_message:
                 print(
@@ -2499,25 +3731,111 @@ def run_live_plot(
                     f"({loaded.size} vs current {x.size})."
                 )
             return False
+        if loaded_main_diag is not None and loaded_main_diag.size != x.size:
+            loaded_main_diag = None
+        if loaded_ref_diag is not None and loaded_ref_diag.size != x.size:
+            loaded_ref_diag = None
         pump_chop_dark_offset = loaded.copy()
+        pump_chop_dark_main_diagnostic_offset = (
+            None if loaded_main_diag is None else loaded_main_diag.copy()
+        )
+        pump_chop_dark_ref_diagnostic_offset = (
+            None if loaded_ref_diag is None else loaded_ref_diag.copy()
+        )
         _set_pump_dark_status(f"active ({pump_chop_dark_path.name})")
         if print_message:
-            print(
-                "Pump-dark offset loaded from "
-                f"{pump_chop_dark_path} and will be subtracted from the "
-                "integrated pump-chop trace."
-            )
+            if (
+                loaded_main_diag is not None
+                or loaded_ref_diag is not None
+            ):
+                print(
+                    "Referenced demod baseline loaded from "
+                    f"{pump_chop_dark_path} and will be subtracted from the "
+                    "integrated S/R, main-only, ref-only, and pairwise-corrected "
+                    "comparison DeltaOD traces when available."
+                )
+            else:
+                print(
+                    "Pump-dark offset loaded from "
+                    f"{pump_chop_dark_path} and will be subtracted from the "
+                    "integrated pump-chop trace."
+                )
         return True
 
-    def _apply_pump_dark_offset(trace):
+    def _apply_pump_dark_offset(trace, role="demod"):
         if trace is None:
             return None
-        if pump_chop_dark_offset is None or not pump_chop_dark_subtract:
-            return trace
+        if not pump_chop_dark_subtract:
+            return np.asarray(trace, dtype=float)
         trace_arr = np.asarray(trace, dtype=float)
-        if pump_chop_dark_offset.size != trace_arr.size:
+        if role == "main_diagnostic":
+            offset = pump_chop_dark_main_diagnostic_offset
+        elif role == "ref_diagnostic":
+            offset = pump_chop_dark_ref_diagnostic_offset
+        else:
+            offset = pump_chop_dark_offset
+        if offset is None or offset.size != trace_arr.size:
             return trace_arr
-        return trace_arr - pump_chop_dark_offset
+        return trace_arr - offset
+
+    def _voltage_delta_to_milliod(delta_trace, baseline_trace):
+        if delta_trace is None or baseline_trace is None:
+            return None
+        delta_arr = np.asarray(delta_trace, dtype=float)
+        baseline_arr = np.asarray(baseline_trace, dtype=float)
+        if delta_arr.size != baseline_arr.size:
+            return np.full(delta_arr.shape, np.nan, dtype=float)
+
+        pumped = baseline_arr + 0.5 * delta_arr
+        unpumped = baseline_arr - 0.5 * delta_arr
+        ratio = np.full(delta_arr.shape, np.nan, dtype=float)
+        valid = (
+            np.isfinite(pumped)
+            & np.isfinite(unpumped)
+            & (np.abs(baseline_arr) >= pump_chop_mod_min_light_v)
+            & (np.abs(pumped) > reference_ratio_floor)
+            & (np.abs(unpumped) > reference_ratio_floor)
+            & ((pumped * unpumped) > 0.0)
+        )
+        np.divide(pumped, unpumped, out=ratio, where=valid)
+        valid &= np.isfinite(ratio) & (ratio > 0.0)
+
+        out = np.full(delta_arr.shape, np.nan, dtype=float)
+        out[valid] = -1000.0 * np.log10(ratio[valid])
+        return out
+
+    def _prepare_chop_display(trace, baseline_trace=None, apply_dark=False, dark_role="demod"):
+        if trace is None:
+            return None
+        trace_arr = (
+            _apply_pump_dark_offset(trace, role=dark_role)
+            if apply_dark
+            else np.asarray(trace, dtype=float)
+        )
+        if pump_chop_display_mode != "milli_od":
+            return trace_arr
+        if read_reference and reference_processing_mode == "ratio":
+            return 1000.0 * trace_arr
+        baseline_arr = (
+            None if baseline_trace is None else np.asarray(baseline_trace, dtype=float)
+        )
+        if (
+            baseline_arr is not None
+            and channel_dark_subtract
+            and channel_dark_main_offset is not None
+            and channel_dark_main_offset.size == baseline_arr.size
+        ):
+            baseline_arr = baseline_arr - channel_dark_main_offset
+        return _voltage_delta_to_milliod(trace_arr, baseline_arr)
+
+    def _trace_rms_pp(trace):
+        if trace is None:
+            return float("nan"), float("nan")
+        arr = np.asarray(trace, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size <= 0:
+            return float("nan"), float("nan")
+        return float(np.std(finite)), float(np.ptp(finite))
 
     def _format_demod_title():
         dark_label = ""
@@ -2527,13 +3845,223 @@ def run_live_plot(
                 if pump_chop_dark_offset is not None
                 else ", dark-ready"
             )
+        if pump_chop_display_mode == "milli_od":
+            leading = (
+                "Referenced Pump-Chop Delta OD (mOD)"
+                if (read_reference and reference_processing_mode == "ratio")
+                else "Pump-Chop Delta OD Estimate (mOD)"
+            )
+        else:
+            leading = (
+                "Referenced Pump-Chop Delta OD"
+                if (read_reference and reference_processing_mode == "ratio")
+                else "Pump-Chop Difference"
+            )
         return (
-            f"Pump-Chop Difference ({demod_mode_label}, "
-            f"sign {pump_chop_sign:+.0f}{dark_label})"
+            f"{leading} ({demod_mode_label}, "
+            f"sign {pump_chop_sign:+.0f}{dark_label}"
+            + (
+                ", baseline-subtracted"
+                if (
+                    read_reference
+                    and reference_processing_mode == "ratio"
+                    and pump_chop_dark_subtract
+                    and pump_chop_dark_offset is not None
+                )
+                else ""
+            )
+            + ")"
         )
 
+    tail_guided_flip_counter = 0
+    tail_guided_last_mean = float("nan")
+
+    def _tail_guided_pair(raw_pair):
+        nonlocal tail_guided_flip_counter, tail_guided_last_mean
+        pair = np.asarray(raw_pair, dtype=float).copy()
+        if not pump_chop_tail_heuristic_enable:
+            return pump_chop_sign * pair
+
+        start = max(0, min(pair.size - 1, int(pump_chop_tail_heuristic_start)))
+        stop = max(start + 1, min(pair.size, int(pump_chop_tail_heuristic_stop)))
+        tail = pair[start:stop]
+        if tail.size <= 0:
+            return pump_chop_sign * pair
+
+        tail_mean = float(np.mean(tail))
+        if np.isfinite(tail_mean):
+            if (
+                pump_chop_tail_heuristic_expected_sign != 0.0
+                and tail_mean * pump_chop_tail_heuristic_expected_sign < 0.0
+            ):
+                pair = -pair
+                tail_mean = -tail_mean
+                tail_guided_flip_counter += 1
+            tail_guided_last_mean = tail_mean
+            if pump_chop_tail_heuristic_zero_baseline:
+                pair = pair - tail_mean
+        return pump_chop_sign * pair
+
+    def _tail_guided_reference_delta_od(current_ratio, previous_ratio):
+        nonlocal tail_guided_flip_counter, tail_guided_last_mean
+        current = np.asarray(current_ratio, dtype=float)
+        previous = np.asarray(previous_ratio, dtype=float)
+        ratio_pair = current - previous
+
+        start = max(0, min(ratio_pair.size - 1, int(pump_chop_tail_heuristic_start)))
+        stop = max(start + 1, min(ratio_pair.size, int(pump_chop_tail_heuristic_stop)))
+        flip_pair = False
+
+        if pump_chop_tail_heuristic_enable:
+            tail = ratio_pair[start:stop]
+            if tail.size > 0:
+                tail_mean = float(np.mean(tail))
+                if np.isfinite(tail_mean):
+                    if (
+                        pump_chop_tail_heuristic_expected_sign != 0.0
+                        and tail_mean * pump_chop_tail_heuristic_expected_sign < 0.0
+                    ):
+                        flip_pair = True
+                        tail_mean = -tail_mean
+                        tail_guided_flip_counter += 1
+                    tail_guided_last_mean = tail_mean
+
+        delta_od = _compute_delta_od_local(current, previous)
+        if flip_pair:
+            delta_od = -delta_od
+        delta_od = pump_chop_sign * delta_od
+
+        if pump_chop_tail_heuristic_enable and pump_chop_tail_heuristic_zero_baseline:
+            tail = delta_od[start:stop]
+            if tail.size > 0:
+                finite_tail = tail[np.isfinite(tail)]
+                if finite_tail.size > 0:
+                    delta_od = delta_od - float(np.mean(finite_tail))
+
+        return delta_od
+
+    def _referenced_phase_diagnostics_local():
+        nonlocal latest_chop_main_diagnostic, latest_chop_ref_diagnostic
+        latest_chop_main_diagnostic = None
+        latest_chop_ref_diagnostic = None
+        if not (
+            reference_processing_mode == "ratio"
+            and ref_line is not None
+            and len(chop_phase0_buffer) > 0
+            and len(chop_phase1_buffer) > 0
+            and len(chop_ref_phase0_buffer) > 0
+            and len(chop_ref_phase1_buffer) > 0
+        ):
+            return None
+
+        phase0_main_mean = chop_phase0_sum / float(len(chop_phase0_buffer))
+        phase1_main_mean = chop_phase1_sum / float(len(chop_phase1_buffer))
+        phase0_ref_mean = chop_ref_phase0_sum / float(len(chop_ref_phase0_buffer))
+        phase1_ref_mean = chop_ref_phase1_sum / float(len(chop_ref_phase1_buffer))
+
+        if pump_chop_sign > 0:
+            pumped_main = phase1_main_mean
+            unpumped_main = phase0_main_mean
+            pumped_ref = phase1_ref_mean
+            unpumped_ref = phase0_ref_mean
+        else:
+            pumped_main = phase0_main_mean
+            unpumped_main = phase1_main_mean
+            pumped_ref = phase0_ref_mean
+            unpumped_ref = phase1_ref_mean
+
+        latest_chop_main_diagnostic = _compute_single_channel_delta_od_local(
+            pumped_main,
+            unpumped_main,
+            channel_dark_main_offset,
+        )
+        latest_chop_ref_diagnostic = _compute_single_channel_delta_od_local(
+            pumped_ref,
+            unpumped_ref,
+            channel_dark_ref_offset,
+        )
+
+        pumped_ratio = _safe_positive_ratio_local(
+            _apply_channel_dark_local(pumped_main, channel_dark_main_offset),
+            _apply_channel_dark_local(pumped_ref, channel_dark_ref_offset),
+        )
+        unpumped_ratio = _safe_positive_ratio_local(
+            _apply_channel_dark_local(unpumped_main, channel_dark_main_offset),
+            _apply_channel_dark_local(unpumped_ref, channel_dark_ref_offset),
+        )
+        return _compute_delta_od_local(pumped_ratio, unpumped_ratio)
+
+    def _set_runtime_pump_chop_sign(new_sign):
+        nonlocal pump_chop_sign
+        nonlocal latest_chop_pair, latest_chop_integrated
+        nonlocal latest_chop_main_diagnostic, latest_chop_ref_diagnostic
+        nonlocal latest_chop_pair_display, latest_chop_integrated_display
+        nonlocal chop_pair_buffer, chop_pair_sum, chop_preview_template
+        nonlocal pump_chop_dark_offset
+        nonlocal pump_chop_dark_main_diagnostic_offset
+        nonlocal pump_chop_dark_ref_diagnostic_offset
+        new_sign = float(new_sign)
+        if new_sign == 0.0:
+            raise ValueError("pump_chop_sign must be non-zero.")
+        old_sign = float(pump_chop_sign)
+        if new_sign == old_sign:
+            return
+        ratio = new_sign / old_sign
+        pump_chop_sign = new_sign
+        if latest_chop_pair is not None:
+            latest_chop_pair = latest_chop_pair * ratio
+        if latest_chop_integrated is not None:
+            latest_chop_integrated = latest_chop_integrated * ratio
+        if latest_chop_main_diagnostic is not None:
+            latest_chop_main_diagnostic = latest_chop_main_diagnostic * ratio
+        if latest_chop_ref_diagnostic is not None:
+            latest_chop_ref_diagnostic = latest_chop_ref_diagnostic * ratio
+        if processor is not None and getattr(processor, "accumulator", None) is not None:
+            processor.accumulator.set_pump_chop_sign(new_sign)
+            processor.accumulator.set_pump_chop_dark_offset(pump_chop_dark_offset)
+        else:
+            if pump_chop_use_adjacent_pairs or pump_chop_tail_heuristic_enable:
+                chop_pair_buffer = deque(
+                    (pair * ratio for pair in chop_pair_buffer),
+                    maxlen=chop_pair_buffer.maxlen,
+                )
+                chop_pair_sum = chop_pair_sum * ratio
+                if chop_preview_template is not None:
+                    chop_preview_template = chop_preview_template * ratio
+        if pump_chop_dark_offset is not None:
+            pump_chop_dark_offset = pump_chop_dark_offset * ratio
+        if pump_chop_dark_main_diagnostic_offset is not None:
+            pump_chop_dark_main_diagnostic_offset = (
+                pump_chop_dark_main_diagnostic_offset * ratio
+            )
+        if pump_chop_dark_ref_diagnostic_offset is not None:
+            pump_chop_dark_ref_diagnostic_offset = (
+                pump_chop_dark_ref_diagnostic_offset * ratio
+            )
+        latest_chop_pair_display = _prepare_chop_display(
+            latest_chop_pair,
+            integrated_line,
+            apply_dark=False,
+        )
+        _reset_pairwise_dark_corrected_local()
+        latest_chop_integrated_display = _prepare_chop_display(
+            latest_chop_integrated,
+            integrated_line,
+            apply_dark=True,
+        )
+        if chop_raw_line_plot is not None and latest_chop_pair_display is not None:
+            chop_raw_line_plot.set_ydata(latest_chop_pair_display)
+        if (
+            chop_integrated_line_plot is not None
+            and latest_chop_integrated_display is not None
+        ):
+            chop_integrated_line_plot.set_ydata(latest_chop_integrated_display)
+        if ax_demod is not None:
+            ax_demod.set_title(_format_demod_title())
+        fig.canvas.draw_idle()
+
     plt.ion()
-    if pump_chop_demod and monitor_pfi9:
+    if pump_chop_demod and rate_plot_enable:
         fig, (ax, ax_demod, ax_trig) = plt.subplots(
             3,
             1,
@@ -2550,7 +4078,7 @@ def run_live_plot(
             sharex=True,
         )
         ax_trig = None
-    elif monitor_pfi9:
+    elif rate_plot_enable:
         fig, (ax, ax_trig) = plt.subplots(
             2,
             1,
@@ -2577,7 +4105,11 @@ def run_live_plot(
         linewidth=1.8,
         label=f"{single_label} integrated ({integration_line_count} lines)",
     )
+    derived_axis = None
     if read_reference:
+        derived_axis = (
+            ax.twinx() if reference_processing_mode == "ratio" else ax
+        )
         ref_raw_line_plot, = ax.plot(
             x,
             np.zeros_like(x, dtype=float),
@@ -2592,21 +4124,24 @@ def run_live_plot(
             linestyle="--",
             label=f"Ref integrated ({integration_line_count} lines)",
         )
-        diff_raw_line_plot, = ax.plot(
+        diff_raw_line_plot, = derived_axis.plot(
             x,
             np.zeros_like(x, dtype=float),
             linewidth=1.0,
             alpha=0.40,
             color="tab:gray",
-            label="Main-Ref raw",
+            label=f"{derived_signal_label} raw",
         )
-        diff_integrated_line_plot, = ax.plot(
+        diff_integrated_line_plot, = derived_axis.plot(
             x,
             np.zeros_like(x, dtype=float),
             linewidth=1.9,
             color="black",
-            label=f"Main-Ref integrated ({integration_line_count} lines)",
+            label=f"{derived_signal_label} integrated ({integration_line_count} lines)",
         )
+        if derived_axis is not ax:
+            derived_axis.set_ylabel(f"{derived_signal_label} ({derived_signal_units})")
+            derived_axis.set_xlim(float(x[0]), float(x[-1]) if x.size else 1.0)
     else:
         ref_raw_line_plot = None
         ref_integrated_line_plot = None
@@ -2621,11 +4156,16 @@ def run_live_plot(
             diff_raw_line_plot.set_visible(False)
 
     ax.set_title("CMOS Video (Simple Mode)")
-    ax.set_xlabel("Sample Index")
+    ax.set_xlabel("Detector-equivalent Sample Index")
     ax.set_ylabel("Voltage (V)")
-    ax.set_xlim(0, max(1, x.size - 1))
+    ax.set_xlim(float(x[0]), float(x[-1]) if x.size else 1.0)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
+    top_handles, top_labels = ax.get_legend_handles_labels()
+    if derived_axis is not None and derived_axis is not ax:
+        derived_handles, derived_labels = derived_axis.get_legend_handles_labels()
+        top_handles += derived_handles
+        top_labels += derived_labels
+    ax.legend(top_handles, top_labels, loc="upper right")
     timing_text = ax.text(
         0.015,
         0.98,
@@ -2649,6 +4189,18 @@ def run_live_plot(
         family="monospace",
         bbox={"facecolor": "#d9f2d9", "alpha": 0.85, "edgecolor": "none"},
     )
+    alert_text = ax.text(
+        0.985,
+        0.90,
+        "",
+        transform=ax.transAxes,
+        va="top",
+        ha="right",
+        fontsize=8,
+        family="monospace",
+        color="#8a1f1f",
+        bbox={"facecolor": "#fff3cd", "alpha": 0.88, "edgecolor": "none"},
+    )
     if ax_demod is not None:
         chop_raw_line_plot, = ax_demod.plot(
             x,
@@ -2657,9 +4209,13 @@ def run_live_plot(
             alpha=0.45,
             color="tab:purple",
             label=(
-                "Chop pair raw (sign-aligned preview)"
-                if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
-                else "Chop pair raw (adjacent)"
+                "Chop pair raw (tail-guided)"
+                if pump_chop_tail_heuristic_enable
+                else (
+                    "Chop pair raw (sign-aligned preview)"
+                    if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+                    else "Chop pair raw (adjacent)"
+                )
             ),
         )
         chop_integrated_line_plot, = ax_demod.plot(
@@ -2668,11 +4224,44 @@ def run_live_plot(
             linewidth=1.9,
             color="tab:purple",
             label=(
-                f"Chop integrated ({integration_line_count} pairs, sign-aligned)"
-                if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
-                else f"Chop integrated ({integration_line_count} lines/phase)"
+                f"Chop integrated ({integration_line_count} pairs, tail-guided)"
+                if pump_chop_tail_heuristic_enable
+                else (
+                    f"Chop integrated ({integration_line_count} pairs, sign-aligned)"
+                    if (pump_chop_use_adjacent_pairs and pump_chop_sign_agnostic_preview)
+                    else f"Chop integrated ({integration_line_count} lines/phase)"
+                )
             ),
         )
+        if read_reference and reference_processing_mode == "ratio":
+            chop_integrated_pairwise_dark_corrected_plot, = ax_demod.plot(
+                x,
+                np.zeros_like(x, dtype=float),
+                linewidth=1.7,
+                linestyle="-.",
+                color="tab:red",
+                label="Chop integrated (pairwise baseline-corrected)",
+            )
+            chop_main_diag_line_plot, = ax_demod.plot(
+                x,
+                np.zeros_like(x, dtype=float),
+                linewidth=1.3,
+                linestyle="--",
+                color="tab:orange",
+                label="Main-only demod integrated (S channel)",
+            )
+            chop_ref_diag_line_plot, = ax_demod.plot(
+                x,
+                np.zeros_like(x, dtype=float),
+                linewidth=1.3,
+                linestyle="--",
+                color="tab:green",
+                label="Ref-only demod integrated (R channel)",
+            )
+        else:
+            chop_integrated_pairwise_dark_corrected_plot = None
+            chop_main_diag_line_plot = None
+            chop_ref_diag_line_plot = None
         ax_demod.axhline(
             0.0,
             color="black",
@@ -2682,21 +4271,24 @@ def run_live_plot(
         if not plot_raw_line:
             chop_raw_line_plot.set_visible(False)
         ax_demod.set_title(_format_demod_title())
-        ax_demod.set_ylabel("Delta V (V)")
-        ax_demod.set_xlabel("Sample Index")
-        ax_demod.set_xlim(0, max(1, x.size - 1))
+        ax_demod.set_ylabel(chop_axis_label)
+        ax_demod.set_xlabel("Detector-equivalent Sample Index")
+        ax_demod.set_xlim(float(x[0]), float(x[-1]) if x.size else 1.0)
         ax_demod.grid(True, alpha=0.3)
         ax_demod.legend(loc="upper right")
     else:
         chop_raw_line_plot = None
         chop_integrated_line_plot = None
+        chop_integrated_pairwise_dark_corrected_plot = None
+        chop_main_diag_line_plot = None
+        chop_ref_diag_line_plot = None
     if ax_trig is not None:
         trigger_plot_history = max(32, int(trigger_plot_history))
         trig_rate_plot, = ax_trig.plot(
             np.arange(trigger_plot_history),
             np.zeros(trigger_plot_history, dtype=float),
             linewidth=1.2,
-            label="PFI9 Edge Rate (Hz)",
+            label=rate_plot_label,
         )
         ax_trig.axhline(
             expected_trigger_hz,
@@ -2705,7 +4297,7 @@ def run_live_plot(
             linewidth=1.0,
         )
         ax_trig.set_xlim(0, max(1, trigger_plot_history - 1))
-        ax_trig.set_ylabel("PFI9 Hz")
+        ax_trig.set_ylabel(rate_plot_ylabel)
         ax_trig.set_xlabel("Recent Updates")
         ax_trig.grid(True, alpha=0.3)
         ax_trig.legend(loc="upper right")
@@ -2714,14 +4306,81 @@ def run_live_plot(
     fig.tight_layout()
     plt.show(block=False)
 
+    stop_requested = False
+    stop_reason = ""
+    no_data_warn_threshold_s = 1.0
+    last_data_t = time.perf_counter()
+    no_data_warning_active = False
+    no_data_warning_printed = False
+
     use_fast_session = bool(use_persistent_session and pda.use_external_trigger)
-    if use_fast_session:
+    fast_rebuild_delay_s = 2.0
+    fast_rebuild_max_attempts = 3
+    fast_rebuild_attempt_count = 0
+    fast_rebuild_deadline_t = None
+    fast_rebuild_exhausted_announced = False
+
+    def _fast_line_mode_text():
         if decouple_acquisition_from_plot and not retrigger_latest_only_read:
-            line_mode = "persistent retriggered session (background ordered processor)"
-        elif decouple_acquisition_from_plot:
-            line_mode = "persistent retriggered session (latest-view reader)"
-        else:
-            line_mode = "persistent retriggered session"
+            return "persistent retriggered session (background ordered processor)"
+        if decouple_acquisition_from_plot:
+            return "persistent retriggered session (latest-view reader)"
+        return "persistent retriggered session"
+
+    def _set_mode_badge(label, color):
+        nonlocal mode_badge_label, mode_badge_color
+        mode_badge_label = str(label)
+        mode_badge_color = str(color)
+        _restore_mode_badge()
+
+    def _restore_mode_badge():
+        mode_text.set_text(mode_badge_label)
+        mode_text.set_bbox(
+            {"facecolor": mode_badge_color, "alpha": 0.85, "edgecolor": "none"}
+        )
+
+    def _show_no_data_indicator(detail):
+        alert_text.set_text("NO-DATA")
+        timing_text.set_text(
+            "No new lines acquired.\n"
+            f"{detail}\n"
+            "Check trigger/camera/DAQ cabling and external sync."
+        )
+
+    def _mark_data_activity():
+        nonlocal last_data_t, no_data_warning_active, no_data_warning_printed
+        last_data_t = time.perf_counter()
+        if no_data_warning_active:
+            _restore_mode_badge()
+            alert_text.set_text("")
+        no_data_warning_active = False
+        no_data_warning_printed = False
+
+    def _maybe_show_no_data_warning(detail):
+        nonlocal no_data_warning_active, no_data_warning_printed
+        if stop_requested:
+            return
+        if fast_rebuild_deadline_t is not None:
+            return
+        idle_s = time.perf_counter() - last_data_t
+        if idle_s < no_data_warn_threshold_s:
+            return
+        if not no_data_warning_printed:
+            print(
+                "Warning: no new lines acquired for "
+                f"{idle_s:.1f} s. {detail}"
+            )
+            no_data_warning_printed = True
+        _show_no_data_indicator(detail)
+        no_data_warning_active = True
+
+    def _request_stop(reason):
+        nonlocal stop_requested, stop_reason
+        stop_requested = True
+        stop_reason = str(reason)
+
+    if use_fast_session:
+        line_mode = _fast_line_mode_text()
     else:
         line_mode = "per-line task build/start"
     mode_badge_label = "FAST"
@@ -2729,10 +4388,7 @@ def run_live_plot(
     if not use_fast_session:
         mode_badge_label = "SAFE"
         mode_badge_color = "#f6f2d9"
-    mode_text.set_text(mode_badge_label)
-    mode_text.set_bbox(
-        {"facecolor": mode_badge_color, "alpha": 0.85, "edgecolor": "none"}
-    )
+    _set_mode_badge(mode_badge_label, mode_badge_color)
 
     print("Starting continuous acquisition. Press Ctrl+C to stop.")
     print(f"External trigger on {pda.trig_in}: {pda.use_external_trigger}")
@@ -2742,6 +4398,27 @@ def run_live_plot(
         f"{pump_chop_demod} "
         + (
             (
+                " (chopper-input grouping: per-line phase is read from "
+                f"{pda.chopper_input_term}; software odd/even inference is bypassed)"
+            )
+            if pump_chop_phase_source == "chopper_input"
+            else
+            (
+                " (tail-guided pair mode: raw pair=line[n]-line[n-1], "
+                f"tail mean over [{pump_chop_tail_heuristic_start}:"
+                f"{pump_chop_tail_heuristic_stop}) is forced toward "
+                f"{pump_chop_tail_heuristic_expected_sign:+.0f}, "
+                f"tail baseline {'subtracted' if pump_chop_tail_heuristic_zero_baseline else 'kept'}, "
+                "then display sign applied)"
+                + (
+                    f" | {tail_window_mapping_note}"
+                    if tail_window_mapping_note
+                    else ""
+                )
+            )
+            if pump_chop_tail_heuristic_enable
+            else
+            (
                 " (adjacent preview: consecutive accepted-line pairs, "
                 "sign-aligned to running template; absolute sign arbitrary)"
             )
@@ -2750,8 +4427,8 @@ def run_live_plot(
                 f"(adjacent mode: {pump_chop_sign:+.0f} * (line[n]-line[n-1]))"
                 if pump_chop_use_adjacent_pairs
                 else (
-                    f"(odd/even mode: {pump_chop_sign:+.0f} * "
-                    "(mean(odd accepted lines)-mean(even accepted lines)))"
+                    f"(phase-bucket mode: {pump_chop_sign:+.0f} * "
+                    "(mean(phase1 accepted lines)-mean(phase0 accepted lines)))"
                 )
             )
         )
@@ -2763,8 +4440,28 @@ def run_live_plot(
     if pump_chop_demod:
         print(
             "Pump-dark baseline: "
-            f"{pump_chop_dark_status} | hotkeys: d=save/apply, l=load, x=clear"
+            f"{pump_chop_dark_status} | hotkeys: d=save/apply, l=load, "
+            "x=clear, s=flip sign, +=set +1, -=set -1"
         )
+        print(f"Pump-chop display units: {chop_signal_units}")
+        if read_reference and reference_processing_mode == "ratio":
+            print(
+                "Referenced demod diagnostics: demod panel overlays final S/R "
+                "DeltaOD plus dashed integrated main-only (S) and ref-only (R) "
+                "demod DeltaOD traces."
+            )
+        if channel_dark_subtract:
+            print(
+                f"{channel_dark_label}: {channel_dark_status} | "
+                "hotkeys: c=save, v=load, n=clear"
+            )
+        if pump_chop_display_mode == "milli_od" and not (
+            read_reference and reference_processing_mode == "ratio"
+        ):
+            print(
+                "Main-only mOD normalization: uses Vavg minus active "
+                f"intensity dark; masks |Vlight| < {pump_chop_mod_min_light_v:.4g} V."
+            )
     if demod_trigger_qualified_acceptance and use_fast_session:
         print(
             "Note: trigger-qualified acceptance is only exact in safe mode. "
@@ -2837,10 +4534,17 @@ def run_live_plot(
         f"CLK delay={pda.clk_initial_delay * 1e6:.1f} us"
     )
     print(
+        "AI sample clock: "
+        f"rate={pda.ai_sample_rate / 1e6:.3f} MHz, "
+        f"divisor={pda.ai_sample_clock_divisor}, "
+        f"source={pda.ai_sample_clk_src}"
+    )
+    print(
         "Video timing: "
         f"AI edge={('ST falling' if pda.ai_start_trigger_edge == Edge.FALLING else 'ST rising')}, "
         f"dummy_clocks={pda.video_dummy_clocks}, "
-        f"pixel_clocks={pda.num_pixels}"
+        f"pixel_clocks={pda.video_pixel_clocks}, "
+        f"output_samples={pda.video_output_samples}"
     )
     print(
         f"Samples/line read={pda.ai_samples_per_line}, "
@@ -2882,12 +4586,18 @@ def run_live_plot(
     integration_sum = np.zeros_like(x, dtype=float)
     ref_line_buffer = deque(maxlen=max(1, int(integration_line_count)))
     ref_integration_sum = np.zeros_like(x, dtype=float)
+    diff_line_buffer = deque(maxlen=max(1, int(integration_line_count)))
+    diff_integration_sum = np.zeros_like(x, dtype=float)
     chop_prev_line = None
     chop_phase = 0
     chop_phase0_buffer = deque(maxlen=max(1, int(integration_line_count)))
     chop_phase1_buffer = deque(maxlen=max(1, int(integration_line_count)))
     chop_phase0_sum = np.zeros_like(x, dtype=float)
     chop_phase1_sum = np.zeros_like(x, dtype=float)
+    chop_ref_phase0_buffer = deque(maxlen=max(1, int(integration_line_count)))
+    chop_ref_phase1_buffer = deque(maxlen=max(1, int(integration_line_count)))
+    chop_ref_phase0_sum = np.zeros_like(x, dtype=float)
+    chop_ref_phase1_sum = np.zeros_like(x, dtype=float)
     chop_pair_buffer = deque(maxlen=max(1, int(integration_line_count)))
     chop_pair_sum = np.zeros_like(x, dtype=float)
     chop_pair_counter = 0
@@ -2895,6 +4605,8 @@ def run_live_plot(
     chop_parity_reset_counter = 0
     latest_chop_pair = None
     latest_chop_integrated = None
+    latest_chop_main_diagnostic = None
+    latest_chop_ref_diagnostic = None
     chop_preview_template = None
     chop_prev_phase = None
     line_rate_hz_buffer = deque(maxlen=32)
@@ -2924,6 +4636,7 @@ def run_live_plot(
     timing_text_update_every_n_lines = max(1, int(timing_text_update_every_n_lines))
     autoscale_every_n_plot_updates = max(1, int(autoscale_every_n_plot_updates))
     plot_update_interval_s = 1.0 / plot_target_fps
+    ui_idle_pause_s = max(0.005, min(0.02, 0.5 * plot_update_interval_s))
     next_plot_update_t = 0.0
     queue_probe_warned = False
     fallback_close_warned = False
@@ -2946,24 +4659,161 @@ def run_live_plot(
     integrated_auc_main = float("nan")
     integrated_auc_ref = float("nan")
     integrated_auc_diff = float("nan")
+    latest_chop_pair_display = None
     latest_chop_integrated_display = None
+    latest_chop_integrated_pairwise_dark_corrected = None
+    line = np.zeros_like(x, dtype=float)
+    integrated_line = np.zeros_like(x, dtype=float)
+    ref_line = None
+    ref_integrated_line = None
+    diff_line = None
+    diff_integrated_line = None
+    chop_pair_dark_corrected_buffer = deque(maxlen=max(1, int(integration_line_count)))
+    chop_pair_dark_corrected_sum = np.zeros_like(x, dtype=float)
 
     original_video_main = pda.video_main
     reader = None
     processor = None
     processor_snapshot_seq_last = 0
     processor_last_warning = None
+    plot_rate_poll_interval_s = 0.01
+    last_plot_rate_read_t = float("-inf")
+    cached_plot_rate_hz = float("nan")
+    cached_plot_rate_count = None
+    derived_chopper_prev_state = None
+    derived_chopper_last_rate_hz = float("nan")
+    derived_chopper_gate_start_t = None
+    derived_chopper_rising_edges = 0
     reader_queue_depth = float("nan")
     reader_queue_max_depth = 0.0
     if ref_only:
         # Repoint single-channel reads to the configured reference input.
         pda.video_main = pda.video_ref
 
+    def _sync_channel_dark_to_runtime():
+        if processor is not None and getattr(processor, "accumulator", None) is not None:
+            processor.accumulator.set_channel_dark_offsets(
+                channel_dark_main_offset,
+                channel_dark_ref_offset,
+            )
+
+    def _sync_pump_dark_to_runtime():
+        if processor is not None and getattr(processor, "accumulator", None) is not None:
+            processor.accumulator.set_pump_chop_dark_offset(
+                pump_chop_dark_offset,
+            )
+
+    def _reference_ratio_local(numerator, denominator):
+        numerator = np.asarray(numerator, dtype=float)
+        denominator = np.asarray(denominator, dtype=float)
+        safe_den = denominator.copy()
+        small_mask = np.abs(safe_den) < reference_ratio_floor
+        if np.any(small_mask):
+            safe_den[small_mask] = np.where(
+                safe_den[small_mask] < 0.0,
+                -reference_ratio_floor,
+                reference_ratio_floor,
+            )
+        ratio = np.divide(
+            numerator,
+            safe_den,
+            out=np.zeros_like(numerator),
+            where=np.isfinite(safe_den),
+        )
+        ratio[~np.isfinite(ratio)] = 0.0
+        return ratio
+
+    def _safe_positive_ratio_local(numerator, denominator):
+        ratio = _reference_ratio_local(numerator, denominator)
+        return np.maximum(ratio, reference_ratio_floor)
+
+    def _compute_delta_od_local(pumped_ratio, unpumped_ratio):
+        pumped_safe = np.maximum(
+            np.asarray(pumped_ratio, dtype=float), reference_ratio_floor
+        )
+        unpumped_safe = np.maximum(
+            np.asarray(unpumped_ratio, dtype=float), reference_ratio_floor
+        )
+        return -np.log10(np.divide(pumped_safe, unpumped_safe))
+
+    def _compute_single_channel_delta_od_local(pumped_signal, unpumped_signal, dark_offset):
+        pumped = _apply_channel_dark_local(pumped_signal, dark_offset)
+        unpumped = _apply_channel_dark_local(unpumped_signal, dark_offset)
+        if pumped is None or unpumped is None:
+            return None
+        pumped_safe = np.asarray(pumped, dtype=float)
+        unpumped_safe = np.asarray(unpumped, dtype=float)
+        valid = (
+            np.isfinite(pumped_safe)
+            & np.isfinite(unpumped_safe)
+            & (pumped_safe > reference_ratio_floor)
+            & (unpumped_safe > reference_ratio_floor)
+        )
+        ratio = np.divide(
+            pumped_safe,
+            unpumped_safe,
+            out=np.ones_like(pumped_safe),
+            where=valid,
+        )
+        valid &= np.isfinite(ratio) & (ratio > 0.0)
+        out = np.full(pumped_safe.shape, np.nan, dtype=float)
+        out[valid] = -np.log10(ratio[valid])
+        return out
+
+    def _apply_channel_dark_local(line_data, dark_offset):
+        if line_data is None:
+            return None
+        arr = np.asarray(line_data, dtype=float)
+        if dark_offset is None:
+            return arr.copy()
+        return arr - dark_offset
+
+    def _demod_source_line_local(main_line, derived_line):
+        if reference_processing_mode == "ratio" and derived_line is not None:
+            return derived_line
+        return main_line
+
+    def _reset_pairwise_dark_corrected_local():
+        nonlocal chop_pair_dark_corrected_buffer
+        nonlocal chop_pair_dark_corrected_sum
+        nonlocal latest_chop_integrated_pairwise_dark_corrected
+        chop_pair_dark_corrected_buffer = deque(
+            maxlen=max(1, int(integration_line_count))
+        )
+        chop_pair_dark_corrected_sum = np.zeros_like(x, dtype=float)
+        latest_chop_integrated_pairwise_dark_corrected = None
+
+    def _update_pairwise_dark_corrected_referenced_local(chop_pair):
+        nonlocal latest_chop_integrated_pairwise_dark_corrected
+        nonlocal chop_pair_dark_corrected_sum
+        if not (
+            reference_processing_mode == "ratio"
+            and pump_chop_dark_offset is not None
+        ):
+            return
+        pair = np.asarray(chop_pair, dtype=float)
+        if pump_chop_dark_offset.size != pair.size:
+            return
+        corrected = pair - pump_chop_dark_offset
+        if len(chop_pair_dark_corrected_buffer) == chop_pair_dark_corrected_buffer.maxlen:
+            chop_pair_dark_corrected_sum -= chop_pair_dark_corrected_buffer.popleft()
+        chop_pair_dark_corrected_buffer.append(corrected.copy())
+        chop_pair_dark_corrected_sum += corrected
+        latest_chop_integrated_pairwise_dark_corrected = (
+            chop_pair_dark_corrected_sum / float(len(chop_pair_dark_corrected_buffer))
+        )
+
     def _on_key_press(event):
         nonlocal pump_chop_dark_offset
+        nonlocal pump_chop_dark_main_diagnostic_offset
+        nonlocal pump_chop_dark_ref_diagnostic_offset
+        nonlocal channel_dark_main_offset, channel_dark_ref_offset
+        key = str(getattr(event, "key", "") or "").lower()
+        if key in {"q", "escape"}:
+            _request_stop("user requested stop from plot window")
+            return
         if not pump_chop_demod:
             return
-        key = str(getattr(event, "key", "") or "").lower()
         if key == "d":
             if latest_chop_integrated is None:
                 print(
@@ -2972,28 +4822,141 @@ def run_live_plot(
                 )
                 return
             trace = np.asarray(latest_chop_integrated, dtype=float)
-            _save_pump_dark_offset(trace)
-            pump_chop_dark_offset = trace.copy()
-            _set_pump_dark_status(f"active ({pump_chop_dark_path.name})")
-            print(
-                "Saved current integrated pump-chop trace as dark offset to "
-                f"{pump_chop_dark_path} and enabled subtraction."
+            main_diag_trace = None
+            ref_diag_trace = None
+            if read_reference and reference_processing_mode == "ratio":
+                if latest_chop_main_diagnostic is not None:
+                    main_diag_trace = np.asarray(
+                        latest_chop_main_diagnostic,
+                        dtype=float,
+                    )
+                if latest_chop_ref_diagnostic is not None:
+                    ref_diag_trace = np.asarray(
+                        latest_chop_ref_diagnostic,
+                        dtype=float,
+                    )
+            _save_pump_dark_offset(
+                trace,
+                main_diagnostic_trace=main_diag_trace,
+                ref_diagnostic_trace=ref_diag_trace,
             )
+            pump_chop_dark_offset = trace.copy()
+            pump_chop_dark_main_diagnostic_offset = (
+                None if main_diag_trace is None else main_diag_trace.copy()
+            )
+            pump_chop_dark_ref_diagnostic_offset = (
+                None if ref_diag_trace is None else ref_diag_trace.copy()
+            )
+            _sync_pump_dark_to_runtime()
+            _reset_pairwise_dark_corrected_local()
+            _set_pump_dark_status(f"active ({pump_chop_dark_path.name})")
+            if read_reference and reference_processing_mode == "ratio":
+                print(
+                    "Saved current integrated referenced DeltaOD baselines to "
+                    f"{pump_chop_dark_path} and enabled subtraction for the "
+                    "final S/R, main-only, ref-only, and pairwise-corrected "
+                    "comparison demod traces."
+                )
+            else:
+                print(
+                    "Saved current integrated pump-chop trace as dark offset to "
+                    f"{pump_chop_dark_path} and enabled subtraction."
+                )
         elif key == "l":
             try:
-                _load_pump_dark_offset(print_message=True)
+                loaded = _load_pump_dark_offset(print_message=True)
+                if loaded:
+                    _sync_pump_dark_to_runtime()
+                    _reset_pairwise_dark_corrected_local()
             except Exception as exc:
                 print(f"Pump-dark load failed: {exc}")
         elif key == "x":
             pump_chop_dark_offset = None
+            pump_chop_dark_main_diagnostic_offset = None
+            pump_chop_dark_ref_diagnostic_offset = None
+            _sync_pump_dark_to_runtime()
+            _reset_pairwise_dark_corrected_local()
             _set_pump_dark_status(
                 "ready ({})".format(pump_chop_dark_path.name)
                 if pump_chop_dark_subtract
                 else "disabled"
             )
             print("Cleared in-memory pump-dark subtraction.")
+        elif key == "s":
+            _set_runtime_pump_chop_sign(-pump_chop_sign)
+            print(f"Pump-chop sign flipped live. New sign={pump_chop_sign:+.0f}.")
+        elif key in {"+", "="}:
+            _set_runtime_pump_chop_sign(+1.0)
+            print("Pump-chop sign set live to +1.")
+        elif key in {"-", "_"}:
+            _set_runtime_pump_chop_sign(-1.0)
+            print("Pump-chop sign set live to -1.")
+        elif key == "c":
+            if not channel_dark_subtract:
+                print(
+                    "Intensity/channel dark capture skipped: dark subtraction is disabled."
+                )
+                return
+            if read_reference and reference_processing_mode == "ratio":
+                if integrated_line is None or ref_integrated_line is None:
+                    print(
+                        "Channel-dark capture skipped: integrated main/ref traces are not available yet."
+                    )
+                    return
+                _save_channel_dark_offsets(integrated_line, ref_integrated_line)
+                channel_dark_main_offset = np.asarray(
+                    integrated_line, dtype=float
+                ).copy()
+                channel_dark_ref_offset = np.asarray(
+                    ref_integrated_line, dtype=float
+                ).copy()
+                _sync_channel_dark_to_runtime()
+                _set_channel_dark_status(f"active ({channel_dark_path.name})")
+                print(
+                    "Saved current integrated main/ref traces as channel-dark offsets to "
+                    f"{channel_dark_path} and enabled referenced channel subtraction."
+                )
+            else:
+                if integrated_line is None:
+                    print(
+                        "Intensity-dark capture skipped: integrated main trace is not available yet."
+                    )
+                    return
+                _save_channel_dark_offsets(integrated_line, None)
+                channel_dark_main_offset = np.asarray(
+                    integrated_line, dtype=float
+                ).copy()
+                channel_dark_ref_offset = None
+                _sync_channel_dark_to_runtime()
+                _set_channel_dark_status(f"active ({channel_dark_path.name})")
+                print(
+                    "Saved current integrated main trace as intensity dark to "
+                    f"{channel_dark_path}; it will only correct the main-only "
+                    "mOD display denominator."
+                )
+        elif key == "v":
+            try:
+                loaded = _load_channel_dark_offsets(print_message=True)
+                if loaded:
+                    _sync_channel_dark_to_runtime()
+            except Exception as exc:
+                print(f"Channel-dark load failed: {exc}")
+        elif key == "n":
+            channel_dark_main_offset = None
+            channel_dark_ref_offset = None
+            _sync_channel_dark_to_runtime()
+            _set_channel_dark_status(
+                "ready ({})".format(channel_dark_path.name)
+                if channel_dark_subtract
+                else "disabled"
+            )
+            print("Cleared in-memory intensity/channel dark subtraction.")
 
     fig.canvas.mpl_connect("key_press_event", _on_key_press)
+    fig.canvas.mpl_connect(
+        "close_event",
+        lambda _event: _request_stop("plot window closed"),
+    )
 
     try:
         session_context = (
@@ -3023,13 +4986,32 @@ def run_live_plot(
                 counter=pfi9_monitor_counter,
                 rate_gate_s=pfi9_rate_gate_s,
             )
-            if monitor_pfi9
+            if requested_pfi9_monitor
+            else nullcontext(None)
+        )
+        chopper_input_monitor_context = (
+            _ChopperInputEdgeMonitorSession(
+                pda,
+                counter=chopper_input_monitor_counter,
+                rate_gate_s=chopper_input_rate_gate_s,
+            )
+            if (
+                requested_chopper_input_monitor
+                and pump_chop_phase_source != "chopper_input"
+            )
+            else nullcontext(None)
+        )
+        chopper_input_state_context = (
+            _ChopperInputStateSession(pda)
+            if pump_chop_phase_source == "chopper_input"
             else nullcontext(None)
         )
         with (
             session_context as session,
             chopper_sync_context as chopper_sync,
             monitor_context as pfi9_monitor,
+            chopper_input_monitor_context as chopper_input_monitor,
+            chopper_input_state_context as chopper_input_state,
         ):
             if pda.chopper_sync_enable:
                 if (
@@ -3046,16 +5028,53 @@ def run_live_plot(
                     and getattr(chopper_sync, "error_text", "")
                 ):
                     print(
-                        "Warning: chopper sync output unavailable; continuing without it: "
-                        f"{str(getattr(chopper_sync, 'error_text', ''))}"
+                            "Warning: chopper sync output unavailable; continuing without it: "
+                            f"{str(getattr(chopper_sync, 'error_text', ''))}"
                     )
+            actual_phase_source = pump_chop_phase_source
+            if actual_phase_source == "chopper_input":
+                if (
+                    chopper_input_state is not None
+                    and getattr(chopper_input_state, "available", False)
+                ):
+                    print(
+                        "Chopper-input phase grouping enabled on "
+                        f"{pda.chopper_input_term}."
+                    )
+                else:
+                    actual_phase_source = "inferred"
+                    print(
+                        "Warning: chopper-input phase grouping unavailable; "
+                        "falling back to inferred grouping. "
+                        f"Detail: {str(getattr(chopper_input_state, 'error_text', ''))}"
+                    )
+            if pump_chop_demod:
+                if actual_phase_source == "chopper_input":
+                    print(
+                        "Pump-chop phase source: "
+                        f"external chopper input on {pda.chopper_input_term}"
+                    )
+                else:
+                    print("Pump-chop phase source: inferred from acquisition order")
+
             accumulator = _LiveLineAccumulator(
                 initial_size=int(pda.output_samples_per_line),
                 integration_line_count=integration_line_count,
                 pump_chop_demod=pump_chop_demod,
                 pump_chop_sign=pump_chop_sign,
+                pump_chop_phase_source=actual_phase_source,
                 pump_chop_use_adjacent_pairs=pump_chop_use_adjacent_pairs,
                 pump_chop_sign_agnostic_preview=pump_chop_sign_agnostic_preview,
+                pump_chop_tail_heuristic_enable=pump_chop_tail_heuristic_enable,
+                pump_chop_tail_heuristic_start=pump_chop_tail_heuristic_start,
+                pump_chop_tail_heuristic_stop=pump_chop_tail_heuristic_stop,
+                pump_chop_tail_heuristic_expected_sign=pump_chop_tail_heuristic_expected_sign,
+                pump_chop_tail_heuristic_zero_baseline=pump_chop_tail_heuristic_zero_baseline,
+                reference_processing_mode=reference_processing_mode,
+                reference_ratio_floor=reference_ratio_floor,
+                channel_dark_main_offset=channel_dark_main_offset,
+                channel_dark_ref_offset=channel_dark_ref_offset,
+                pump_chop_dark_offset=pump_chop_dark_offset,
                 capture_hit_rate_enable=capture_hit_rate_enable,
                 capture_hit_rate_window_lines=capture_hit_rate_window_lines,
                 capture_hit_warmup_lines=capture_hit_warmup_lines,
@@ -3078,16 +5097,366 @@ def run_live_plot(
                         "PFI9 monitor unavailable; continuing without it: "
                         f"{pfi9_err}"
                     )
+            if chopper_input_monitor is not None:
+                if getattr(chopper_input_monitor, "available", False):
+                    print(
+                        "Chopper-input monitor enabled on "
+                        f"{chopper_input_monitor.counter} "
+                        f"(source: {pda.chopper_input_term}, gate: "
+                        f"{chopper_input_monitor.rate_gate_s * 1e3:.0f} ms)."
+                    )
+                elif getattr(chopper_input_monitor, "error_text", ""):
+                    print(
+                        "Chopper-input monitor unavailable; continuing without it: "
+                        f"{str(getattr(chopper_input_monitor, 'error_text', ''))}"
+                    )
+            elif requested_chopper_input_monitor and actual_phase_source == "chopper_input":
+                print(
+                    "Chopper-input monitor: deriving displayed rate from "
+                    f"{pda.chopper_input_term} phase labels."
+                )
+            active_rate_gate_s = None
+            if (
+                rate_plot_is_chopper_input
+                and chopper_input_monitor is not None
+                and getattr(chopper_input_monitor, "available", False)
+            ):
+                active_rate_gate_s = float(chopper_input_monitor.rate_gate_s)
+            elif rate_plot_is_chopper_input and actual_phase_source == "chopper_input":
+                active_rate_gate_s = float(chopper_input_rate_gate_s)
+            elif (
+                pfi9_monitor is not None
+                and getattr(pfi9_monitor, "available", False)
+            ):
+                active_rate_gate_s = float(pfi9_monitor.rate_gate_s)
+            if active_rate_gate_s is not None:
+                plot_rate_poll_interval_s = max(
+                    0.01,
+                    min(0.05, 0.5 * active_rate_gate_s),
+                )
+
+            def _read_plot_rate():
+                nonlocal last_plot_rate_read_t, cached_plot_rate_hz
+                nonlocal cached_plot_rate_count
+                now = time.perf_counter()
+                if (
+                    np.isfinite(cached_plot_rate_hz)
+                    and (now - last_plot_rate_read_t) < plot_rate_poll_interval_s
+                ):
+                    return cached_plot_rate_hz, cached_plot_rate_count
+                if (
+                    rate_plot_is_chopper_input
+                    and actual_phase_source == "chopper_input"
+                ):
+                    cached_plot_rate_hz = float(derived_chopper_last_rate_hz)
+                    cached_plot_rate_count = None
+                    last_plot_rate_read_t = now
+                    return cached_plot_rate_hz, cached_plot_rate_count
+                if (
+                    rate_plot_is_chopper_input
+                    and chopper_input_monitor is not None
+                    and getattr(chopper_input_monitor, "available", False)
+                ):
+                    rate_hz, rate_count = chopper_input_monitor.read_rate()
+                    cached_plot_rate_hz = float(rate_hz)
+                    cached_plot_rate_count = rate_count
+                    last_plot_rate_read_t = now
+                    return cached_plot_rate_hz, cached_plot_rate_count
+                if (
+                    pfi9_monitor is not None
+                    and getattr(pfi9_monitor, "available", False)
+                ):
+                    rate_hz, rate_count = pfi9_monitor.read_rate()
+                    cached_plot_rate_hz = float(rate_hz)
+                    cached_plot_rate_count = rate_count
+                    last_plot_rate_read_t = now
+                    return cached_plot_rate_hz, cached_plot_rate_count
+                cached_plot_rate_hz = float("nan")
+                cached_plot_rate_count = None
+                last_plot_rate_read_t = now
+                return cached_plot_rate_hz, cached_plot_rate_count
+
+            def _rate_status_line():
+                if rate_plot_is_chopper_input:
+                    if actual_phase_source == "chopper_input":
+                        return (
+                            "Chopper monitor: derived from phase labels "
+                            f"({pda.chopper_input_term}, gate={chopper_input_rate_gate_s * 1e3:.1f} ms)"
+                        )
+                    if chopper_input_monitor is None:
+                        return "Chopper monitor: disabled"
+                    if getattr(chopper_input_monitor, "available", False):
+                        return (
+                            "Chopper monitor: active "
+                            f"({chopper_input_monitor.counter}, "
+                            f"src={pda.chopper_input_term}, "
+                            f"gate={chopper_input_monitor.rate_gate_s * 1e3:.1f} ms)"
+                        )
+                    chop_err = str(
+                        getattr(chopper_input_monitor, "error_text", "")
+                    ).strip()
+                    if len(chop_err) > 90:
+                        chop_err = chop_err[:87] + "..."
+                    return "Chopper monitor: unavailable" + (
+                        f" ({chop_err})" if chop_err else ""
+                    )
+                if pfi9_monitor is None:
+                    return (
+                        "PFI9 monitor: disabled; plotting DAQ line rate"
+                        if (rate_plot_enable and not rate_plot_is_pfi9)
+                        else "PFI9 monitor: disabled"
+                    )
+                if getattr(pfi9_monitor, "available", False):
+                    return (
+                        "PFI9 monitor: active "
+                        f"({pfi9_monitor.counter}, gate={pfi9_monitor.rate_gate_s * 1e3:.1f} ms)"
+                    )
+                pfi9_err = str(getattr(pfi9_monitor, "error_text", "")).strip()
+                if len(pfi9_err) > 90:
+                    pfi9_err = pfi9_err[:87] + "..."
+                return "PFI9 monitor: unavailable" + (
+                    f" ({pfi9_err})" if pfi9_err else ""
+                )
+
+            def _read_chopper_phase_state():
+                if actual_phase_source != "chopper_input":
+                    return None
+                if (
+                    chopper_input_state is None
+                    or not getattr(chopper_input_state, "available", False)
+                ):
+                    return None
+                return chopper_input_state.read_state()
+
+            def _attach_phase_state(raw_data):
+                nonlocal derived_chopper_prev_state
+                nonlocal derived_chopper_last_rate_hz
+                nonlocal derived_chopper_gate_start_t
+                nonlocal derived_chopper_rising_edges
+                if actual_phase_source != "chopper_input":
+                    return raw_data
+                phase_state = _read_chopper_phase_state()
+                if phase_state is None:
+                    return raw_data
+
+                def _update_derived_rate(state_sequence):
+                    nonlocal derived_chopper_prev_state
+                    nonlocal derived_chopper_last_rate_hz
+                    nonlocal derived_chopper_gate_start_t
+                    nonlocal derived_chopper_rising_edges
+                    now = time.perf_counter()
+                    if derived_chopper_gate_start_t is None:
+                        derived_chopper_gate_start_t = now
+                    for state_value in state_sequence:
+                        state_value = int(bool(state_value))
+                        if (
+                            derived_chopper_prev_state is not None
+                            and derived_chopper_prev_state == 0
+                            and state_value == 1
+                        ):
+                            derived_chopper_rising_edges += 1
+                        derived_chopper_prev_state = state_value
+                    gate_dt = now - derived_chopper_gate_start_t
+                    if gate_dt >= chopper_input_rate_gate_s:
+                        derived_chopper_last_rate_hz = float(
+                            derived_chopper_rising_edges / max(gate_dt, 1e-6)
+                        )
+                        derived_chopper_gate_start_t = now
+                        derived_chopper_rising_edges = 0
+
+                def _wrap_one(item, state_value):
+                    if isinstance(item, dict):
+                        wrapped = dict(item)
+                        wrapped["_phase_state"] = int(bool(state_value))
+                        return wrapped
+                    return {
+                        "main": item,
+                        "_phase_state": int(bool(state_value)),
+                    }
+
+                if isinstance(raw_data, list):
+                    latest_state = int(bool(phase_state))
+                    wrapped_items = []
+                    state_sequence = []
+                    item_count = len(raw_data)
+                    for idx, item in enumerate(raw_data):
+                        item_state = latest_state ^ ((item_count - 1 - idx) & 1)
+                        state_sequence.append(item_state)
+                        wrapped_items.append(_wrap_one(item, item_state))
+                    _update_derived_rate(state_sequence)
+                    return wrapped_items
+                _update_derived_rate([phase_state])
+                return _wrap_one(raw_data, phase_state)
             reader = None
             processor = None
+
+            def _schedule_fast_rebuild():
+                nonlocal fast_rebuild_deadline_t, fast_rebuild_exhausted_announced
+                if not use_fast_session:
+                    return
+                if fast_rebuild_attempt_count >= fast_rebuild_max_attempts:
+                    fast_rebuild_deadline_t = None
+                    if not fast_rebuild_exhausted_announced:
+                        print(
+                            "Fast-session rebuild limit reached; remaining in safe mode."
+                        )
+                        fast_rebuild_exhausted_announced = True
+                    return
+                fast_rebuild_deadline_t = (
+                    time.perf_counter() + fast_rebuild_delay_s
+                )
+                _mark_data_activity()
+                print(
+                    "Scheduling retriggered-session rebuild in "
+                    f"{fast_rebuild_delay_s:.1f} s "
+                    f"({fast_rebuild_attempt_count + 1}/{fast_rebuild_max_attempts})."
+                )
+
+            def _try_fast_rebuild():
+                nonlocal session, reader, processor, line_mode
+                nonlocal fast_rebuild_deadline_t, fast_rebuild_attempt_count
+                nonlocal fast_rebuild_exhausted_announced
+                nonlocal parity_reset_requested, parity_reset_reason
+                if not use_fast_session or session is not None:
+                    return False
+                if fast_rebuild_deadline_t is None:
+                    return False
+                if time.perf_counter() < fast_rebuild_deadline_t:
+                    return False
+                if fast_rebuild_attempt_count >= fast_rebuild_max_attempts:
+                    fast_rebuild_deadline_t = None
+                    if not fast_rebuild_exhausted_announced:
+                        print(
+                            "Fast-session rebuild limit reached; remaining in safe mode."
+                        )
+                        fast_rebuild_exhausted_announced = True
+                    return False
+
+                fast_rebuild_attempt_count += 1
+                fast_rebuild_deadline_t = None
+                rebuild_idx = fast_rebuild_attempt_count
+                print(
+                    "Attempting retriggered-session rebuild "
+                    f"({rebuild_idx}/{fast_rebuild_max_attempts})..."
+                )
+                rebuilt_session = None
+                rebuilt_reader = None
+                rebuilt_processor = None
+                try:
+                    rebuilt_session = _RetriggerLineSession(
+                        pda,
+                        ai_buffer_lines=persistent_ai_buffer_lines,
+                        read_reference=read_reference,
+                        tdms_log_enable=tdms_log_enable,
+                        tdms_file_path=tdms_file_path,
+                        tdms_group_name=tdms_group_name,
+                        tdms_logging_mode=tdms_logging_mode,
+                        tdms_logging_operation=tdms_logging_operation,
+                        latest_only_read=retrigger_latest_only_read,
+                        overwrite_unread=retrigger_overwrite_unread,
+                    ).__enter__()
+                    if (
+                        decouple_acquisition_from_plot
+                        and not retrigger_latest_only_read
+                    ):
+
+                        def _processor_pull():
+                            fast_data = rebuilt_session.read_available_lines(
+                                max_lines=ordered_read_batch_lines,
+                                timeout=background_read_timeout_s,
+                            )
+                            fast_data = _attach_phase_state(fast_data)
+                            fast_lines = (
+                                len(fast_data)
+                                if isinstance(fast_data, list)
+                                else 1
+                            )
+                            return fast_data, max(1, fast_lines)
+
+                        rebuilt_processor = _BackgroundAccumulatorProcessor(
+                            _processor_pull,
+                            accumulator=accumulator,
+                            read_reference=read_reference,
+                            snapshot_interval_s=max(
+                                0.005, 0.5 * plot_update_interval_s
+                            ),
+                        ).start()
+                        print(
+                            "Background processor re-enabled after rebuild "
+                            f"(batch up to {ordered_read_batch_lines} lines/read)."
+                        )
+                    elif decouple_acquisition_from_plot:
+
+                        def _reader_pull():
+                            fast_data = _attach_phase_state(
+                                rebuilt_session.read_line(
+                                    timeout=background_read_timeout_s
+                                )
+                            )
+                            fast_lines = int(
+                                getattr(rebuilt_session, "last_lines_consumed", 1)
+                            )
+                            return fast_data, max(1, fast_lines)
+
+                        rebuilt_reader = _BackgroundLineReader(
+                            _reader_pull,
+                            max_packets=reader_fifo_max_packets,
+                        ).start()
+                        print(
+                            "Background reader re-enabled after rebuild with "
+                            "strict FIFO ordering."
+                        )
+
+                    session = rebuilt_session
+                    reader = rebuilt_reader
+                    processor = rebuilt_processor
+                    line_mode = _fast_line_mode_text()
+                    print(f"Acquisition mode: {line_mode}")
+                    _set_mode_badge("FAST", "#d9f2d9")
+                    _mark_data_activity()
+                    accumulator.request_parity_reset("fast-session rebuild")
+                    parity_reset_requested = True
+                    parity_reset_reason = "fast-session rebuild"
+                    print(
+                        "Retriggered-session rebuild succeeded; returned to fast mode."
+                    )
+                    return True
+                except Exception as rebuild_exc:
+                    if rebuilt_processor is not None:
+                        try:
+                            rebuilt_processor.close()
+                        except Exception:
+                            pass
+                    if rebuilt_reader is not None:
+                        try:
+                            rebuilt_reader.close()
+                        except Exception:
+                            pass
+                    if rebuilt_session is not None:
+                        try:
+                            rebuilt_session.close()
+                        except Exception:
+                            pass
+                    print(
+                        "Warning: retriggered-session rebuild attempt "
+                        f"{rebuild_idx}/{fast_rebuild_max_attempts} failed. "
+                        f"Continuing in safe mode. Detail: {rebuild_exc}"
+                    )
+                    _schedule_fast_rebuild()
+                    return False
+
             if (
                 session is not None
                 and decouple_acquisition_from_plot
                 and not retrigger_latest_only_read
             ):
                 def _processor_pull():
-                    fast_data = session.read_line(timeout=acquisition_timeout_s)
-                    fast_lines = int(getattr(session, "last_lines_consumed", 1))
+                    fast_data = session.read_available_lines(
+                        max_lines=ordered_read_batch_lines,
+                        timeout=background_read_timeout_s,
+                    )
+                    fast_data = _attach_phase_state(fast_data)
+                    fast_lines = len(fast_data) if isinstance(fast_data, list) else 1
                     return fast_data, max(1, fast_lines)
 
                 processor = _BackgroundAccumulatorProcessor(
@@ -3098,11 +5467,14 @@ def run_live_plot(
                 ).start()
                 print(
                     "Background processor enabled: ordered acquisition plus "
-                    "odd/even accumulation now run off the GUI thread."
+                    "phase-bucket accumulation now runs off the GUI thread "
+                    f"(batch up to {ordered_read_batch_lines} lines/read)."
                 )
             elif session is not None and decouple_acquisition_from_plot:
                 def _reader_pull():
-                    fast_data = session.read_line(timeout=acquisition_timeout_s)
+                    fast_data = _attach_phase_state(
+                        session.read_line(timeout=background_read_timeout_s)
+                    )
                     fast_lines = int(getattr(session, "last_lines_consumed", 1))
                     return fast_data, max(1, fast_lines)
 
@@ -3115,6 +5487,8 @@ def run_live_plot(
                     "from plotting loop with strict FIFO ordering."
                 )
             while True:
+                if stop_requested:
+                    break
                 pending_lines = float("nan")
                 if session is not None:
                     try:
@@ -3129,6 +5503,8 @@ def run_live_plot(
                                 f"from AI stream. Detail: {exc}"
                             )
                             queue_probe_warned = True
+                if _try_fast_rebuild():
+                    continue
 
                 if processor is not None:
                     try:
@@ -3140,16 +5516,16 @@ def run_live_plot(
                             or int(snap.get("snapshot_seq", 0))
                             <= int(processor_snapshot_seq_last)
                         ):
-                            if (
-                                pfi9_monitor is not None
-                                and getattr(pfi9_monitor, "available", False)
-                            ):
-                                pfi9_rate_idle, _ = pfi9_monitor.read_rate()
-                                if np.isfinite(pfi9_rate_idle):
-                                    pfi9_rate_hz_buffer.append(float(pfi9_rate_idle))
-                            plt.pause(0.001)
+                            plot_rate_idle, _ = _read_plot_rate()
+                            if np.isfinite(plot_rate_idle):
+                                pfi9_rate_hz_buffer.append(float(plot_rate_idle))
+                            _maybe_show_no_data_warning(
+                                "No accepted acquisition snapshots yet."
+                            )
+                            plt.pause(ui_idle_pause_s)
                             continue
                         processor_snapshot_seq_last = int(snap["snapshot_seq"])
+                        _mark_data_activity()
                         read_service_rate_hz = float(snap["service_rate_hz"])
                         wall_line_rate_hz = float(snap["wall_line_rate_hz"])
                         line_counter = int(snap["line_counter"])
@@ -3189,6 +5565,28 @@ def run_live_plot(
                                 snap["latest_chop_integrated"], dtype=float
                             )
                         )
+                        latest_chop_integrated_pairwise_dark_corrected = (
+                            None
+                            if snap.get("latest_chop_integrated_pairwise_dark_corrected") is None
+                            else np.asarray(
+                                snap["latest_chop_integrated_pairwise_dark_corrected"],
+                                dtype=float,
+                            )
+                        )
+                        latest_chop_main_diagnostic = (
+                            None
+                            if snap.get("latest_chop_main_diagnostic") is None
+                            else np.asarray(
+                                snap["latest_chop_main_diagnostic"], dtype=float
+                            )
+                        )
+                        latest_chop_ref_diagnostic = (
+                            None
+                            if snap.get("latest_chop_ref_diagnostic") is None
+                            else np.asarray(
+                                snap["latest_chop_ref_diagnostic"], dtype=float
+                            )
+                        )
                         integrated_auc_main = float(snap["integrated_auc_main"])
                         integrated_auc_ref = float(snap["integrated_auc_ref"])
                         integrated_auc_diff = float(snap["integrated_auc_diff"])
@@ -3201,6 +5599,12 @@ def run_live_plot(
                         chop_pair_counter = int(snap["chop_pair_counter"])
                         chop_preview_flip_counter = int(
                             snap["chop_preview_flip_counter"]
+                        )
+                        tail_guided_flip_counter = int(
+                            snap.get("tail_guided_flip_counter", 0)
+                        )
+                        tail_guided_last_mean = float(
+                            snap.get("tail_guided_last_mean", float("nan"))
                         )
                         chop_parity_reset_counter = int(
                             snap["chop_parity_reset_counter"]
@@ -3258,27 +5662,23 @@ def run_live_plot(
                             session = None
                             line_mode = "per-line task build/start (fallback)"
                             print(f"Acquisition mode: {line_mode}")
-                            mode_badge_label = "SAFE-FALLBACK"
-                            mode_badge_color = "#f7d9d9"
-                            mode_text.set_text(mode_badge_label)
-                            mode_text.set_bbox(
-                                {
-                                    "facecolor": mode_badge_color,
-                                    "alpha": 0.85,
-                                    "edgecolor": "none",
-                                }
-                            )
+                            _set_mode_badge("SAFE-FALLBACK", "#f7d9d9")
                             accumulator.request_parity_reset(
                                 "fast-session fallback/possible line loss"
                             )
+                            _schedule_fast_rebuild()
                             continue
                         raise
 
-                    pfi9_rate_hz = float("nan")
-                    if pfi9_monitor is not None and getattr(pfi9_monitor, "available", False):
-                        pfi9_rate_hz, pfi9_count = pfi9_monitor.read_rate()
-                        if np.isfinite(pfi9_rate_hz):
-                            pfi9_rate_hz_buffer.append(float(pfi9_rate_hz))
+                    pfi9_rate_hz, _ = _read_plot_rate()
+                    pfi9_count = None
+                    if np.isfinite(pfi9_rate_hz):
+                        pfi9_rate_hz_buffer.append(float(pfi9_rate_hz))
+                    if (
+                        pfi9_monitor is not None
+                        and getattr(pfi9_monitor, "available", False)
+                    ):
+                        _, pfi9_count = pfi9_monitor.read_rate()
                     if pda.use_external_trigger:
                         if np.isfinite(pfi9_rate_hz) and pfi9_rate_hz > 0:
                             trigger_eff = min(1.0, wall_line_rate_hz / pfi9_rate_hz)
@@ -3290,6 +5690,12 @@ def run_live_plot(
                             trigger_eff = 1.0
                     else:
                         trigger_eff = 1.0
+                    if (
+                        rate_plot_enable
+                        and not (rate_plot_is_pfi9 or rate_plot_is_chopper_input)
+                        and np.isfinite(wall_line_rate_hz)
+                    ):
+                        pfi9_rate_hz_buffer.append(float(wall_line_rate_hz))
 
                     if (
                         expected_trigger_hz > 0
@@ -3306,7 +5712,7 @@ def run_live_plot(
 
                     size_changed = False
                     if line.size != x.size:
-                        x = np.arange(line.size)
+                        x = pda.output_sample_axis(line.size)
                         raw_line_plot.set_xdata(x)
                         integrated_line_plot.set_xdata(x)
                         if ref_raw_line_plot is not None:
@@ -3317,13 +5723,21 @@ def run_live_plot(
                             diff_raw_line_plot.set_xdata(x)
                         if diff_integrated_line_plot is not None:
                             diff_integrated_line_plot.set_xdata(x)
+                        if derived_axis is not None and derived_axis is not ax:
+                            derived_axis.set_xlim(float(x[0]), float(x[-1]))
                         if chop_raw_line_plot is not None:
                             chop_raw_line_plot.set_xdata(x)
                         if chop_integrated_line_plot is not None:
                             chop_integrated_line_plot.set_xdata(x)
-                        ax.set_xlim(0, max(1, line.size - 1))
+                        if chop_integrated_pairwise_dark_corrected_plot is not None:
+                            chop_integrated_pairwise_dark_corrected_plot.set_xdata(x)
+                        if chop_main_diag_line_plot is not None:
+                            chop_main_diag_line_plot.set_xdata(x)
+                        if chop_ref_diag_line_plot is not None:
+                            chop_ref_diag_line_plot.set_xdata(x)
+                        ax.set_xlim(float(x[0]), float(x[-1]))
                         if ax_demod is not None:
-                            ax_demod.set_xlim(0, max(1, line.size - 1))
+                            ax_demod.set_xlim(float(x[0]), float(x[-1]))
                         if (
                             pump_chop_dark_offset is not None
                             and pump_chop_dark_offset.size != line.size
@@ -3364,10 +5778,21 @@ def run_live_plot(
                         and diff_integrated_line is not None
                     ):
                         diff_integrated_line_plot.set_ydata(diff_integrated_line)
-                    if chop_raw_line_plot is not None and latest_chop_pair is not None:
-                        chop_raw_line_plot.set_ydata(latest_chop_pair)
-                    latest_chop_integrated_display = _apply_pump_dark_offset(
-                        latest_chop_integrated
+                    latest_chop_pair_display = _prepare_chop_display(
+                        latest_chop_pair,
+                        integrated_line,
+                        apply_dark=False,
+                    )
+                    if (
+                        chop_raw_line_plot is not None
+                        and latest_chop_pair_display is not None
+                    ):
+                        chop_raw_line_plot.set_ydata(latest_chop_pair_display)
+                    latest_chop_integrated_display = _prepare_chop_display(
+                        latest_chop_integrated,
+                        integrated_line,
+                        apply_dark=True,
+                        dark_role="demod",
                     )
                     if (
                         chop_integrated_line_plot is not None
@@ -3376,29 +5801,82 @@ def run_live_plot(
                         chop_integrated_line_plot.set_ydata(
                             latest_chop_integrated_display
                         )
+                    latest_chop_integrated_pairwise_dark_corrected_display = _prepare_chop_display(
+                        latest_chop_integrated_pairwise_dark_corrected,
+                        integrated_line,
+                        apply_dark=False,
+                    )
+                    if (
+                        chop_integrated_pairwise_dark_corrected_plot is not None
+                        and latest_chop_integrated_pairwise_dark_corrected_display is not None
+                    ):
+                        chop_integrated_pairwise_dark_corrected_plot.set_ydata(
+                            latest_chop_integrated_pairwise_dark_corrected_display
+                        )
+                    latest_chop_main_diag_display = _prepare_chop_display(
+                        latest_chop_main_diagnostic,
+                        integrated_line,
+                        apply_dark=True,
+                        dark_role="main_diagnostic",
+                    )
+                    latest_chop_ref_diag_display = _prepare_chop_display(
+                        latest_chop_ref_diagnostic,
+                        ref_integrated_line,
+                        apply_dark=True,
+                        dark_role="ref_diagnostic",
+                    )
+                    if (
+                        chop_main_diag_line_plot is not None
+                        and latest_chop_main_diag_display is not None
+                    ):
+                        chop_main_diag_line_plot.set_ydata(
+                            latest_chop_main_diag_display
+                        )
+                    if (
+                        chop_ref_diag_line_plot is not None
+                        and latest_chop_ref_diag_display is not None
+                    ):
+                        chop_ref_diag_line_plot.set_ydata(
+                            latest_chop_ref_diag_display
+                        )
 
                     ax.set_title(
                         "CMOS Video (Simple Mode) "
-                        f"| mode={mode_key} "
-                        f"| st_delay={pda.st_initial_delay * 1e6:.1f} us "
-                        f"| clk_delay={pda.clk_initial_delay * 1e6:.1f} us "
-                        f"| integrated N={line_buffer_len} "
-                        f"| svc={read_service_rate_hz:.1f} Hz "
-                        f"| wall={wall_line_rate_hz:.1f} Hz "
-                        f"| eff={100.0 * trigger_eff:.1f}%"
+                        + f"| mode={mode_key} "
+                        + (
+                            f"| derived={derived_signal_label} "
+                            if read_reference
+                            else ""
+                        )
+                        + f"| st_delay={pda.st_initial_delay * 1e6:.1f} us "
+                        + f"| clk_delay={pda.clk_initial_delay * 1e6:.1f} us "
+                        + f"| integrated N={line_buffer_len} "
+                        + f"| svc={read_service_rate_hz:.1f} Hz "
+                        + f"| wall={wall_line_rate_hz:.1f} Hz "
+                        + f"| eff={100.0 * trigger_eff:.1f}%"
                         + (
                             f" | q~{pending_lines:.1f} lines"
                             if session is not None and np.isfinite(pending_lines)
                             else ""
                         )
                         + (
-                            f" | pfi9~{pfi9_rate_hz:.1f} Hz"
+                            f" | {rate_title_prefix}~{pfi9_rate_hz:.1f} Hz"
                             if np.isfinite(pfi9_rate_hz)
                             else ""
                         )
                         + (
                             f" | chop_pairs={chop_pair_counter}"
                             if pump_chop_demod
+                            else ""
+                        )
+                        + (
+                            f" | phase={pda.chopper_input_term.split('/')[-1]}"
+                            if (pump_chop_demod and actual_phase_source == "chopper_input")
+                            else ""
+                        )
+                        + (
+                            f" | tailflips={tail_guided_flip_counter} tail={tail_guided_last_mean:+.3g}"
+                            if (pump_chop_demod and pump_chop_tail_heuristic_enable)
                             else ""
                         )
                         + (
@@ -3415,21 +5893,7 @@ def run_live_plot(
                         d = pda.get_timing_diagnostics(
                             trigger_frequency_hz=expected_trigger_hz
                         )
-                        if pfi9_monitor is None:
-                            pfi9_status_line = "PFI9 monitor: disabled"
-                        elif getattr(pfi9_monitor, "available", False):
-                            pfi9_status_line = (
-                                "PFI9 monitor: active "
-                                f"({pfi9_monitor.counter}, gate={pfi9_monitor.rate_gate_s * 1e3:.1f} ms)"
-                            )
-                        else:
-                            pfi9_err = str(getattr(pfi9_monitor, "error_text", "")).strip()
-                            if len(pfi9_err) > 90:
-                                pfi9_err = pfi9_err[:87] + "..."
-                            pfi9_status_line = (
-                                "PFI9 monitor: unavailable"
-                                + (f" ({pfi9_err})" if pfi9_err else "")
-                            )
+                        pfi9_status_line = _rate_status_line()
                         pfi9_med = (
                             float(np.median(pfi9_rate_hz_buffer))
                             if pfi9_rate_hz_buffer
@@ -3452,8 +5916,9 @@ def run_live_plot(
                         ]
                         if np.isfinite(integrated_auc_ref):
                             timing_lines.append(
-                                f"AUC ref/diff={integrated_auc_ref:.6g}/"
-                                f"{integrated_auc_diff:.6g} V*s"
+                                f"AUC ref/{derived_signal_label}="
+                                f"{integrated_auc_ref:.6g}/"
+                                f"{integrated_auc_diff:.6g} {derived_signal_units}*s"
                             )
                         timing_lines.append(
                             (
@@ -3475,8 +5940,8 @@ def run_live_plot(
                             )
                         )
                         if np.isfinite(pfi9_med):
-                            pfi9_line = f"PFI9 med={pfi9_med:.1f} Hz"
-                            if expected_trigger_hz > 0:
+                            pfi9_line = f"{rate_med_label}={pfi9_med:.1f} Hz"
+                            if rate_plot_is_pfi9 and expected_trigger_hz > 0:
                                 pfi9_line += f" ({pfi9_med / expected_trigger_hz:.2f}x)"
                             timing_lines.append(pfi9_line)
                         if np.isfinite(queue_med):
@@ -3503,7 +5968,13 @@ def run_live_plot(
                                     f"{capture_hit_warmup_lines}"
                                 )
                         if pump_chop_demod:
-                            chop_line = f"Chop {demod_mode_label}"
+                            chop_line = (
+                                f"Chop {demod_mode_label} sign={pump_chop_sign:+.0f}"
+                            )
+                            if actual_phase_source == "chopper_input":
+                                chop_line += (
+                                    f" phase={pda.chopper_input_term.split('/')[-1]}"
+                                )
                             if pump_chop_use_adjacent_pairs:
                                 chop_line += f" pairs={pair_buffer_len}"
                                 if pump_chop_sign_agnostic_preview:
@@ -3512,20 +5983,24 @@ def run_live_plot(
                                 chop_line += (
                                     f" ph0/ph1={phase0_buffer_len}/"
                                     f"{phase1_buffer_len}"
-                                )
+                            )
                             chop_line += f" resets={chop_parity_reset_counter}"
                             timing_lines.append(chop_line)
                             timing_lines.append(f"Dark={pump_chop_dark_status}")
-                            if latest_chop_integrated_display is not None:
-                                chop_rms = float(
-                                    np.std(latest_chop_integrated_display)
+                            if channel_dark_subtract:
+                                timing_lines.append(
+                                    f"{channel_dark_label}={channel_dark_status}"
                                 )
-                                chop_pp = float(
-                                    np.ptp(latest_chop_integrated_display)
+                            if latest_chop_integrated_display is not None:
+                                chop_rms, chop_pp = _trace_rms_pp(
+                                    latest_chop_integrated_display
                                 )
                                 timing_lines.append(
-                                    f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} V"
+                                    f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} {chop_signal_units}"
                                 )
+                            timing_lines.append(
+                                "Keys: d save diff-dark | l load | x clear | c save intensity/chan-dark | v load | n clear | s flip | +/- sign | q/esc stop"
+                            )
                         timing_text.set_text("\n".join(timing_lines))
 
                     if ax_trig is not None and trig_rate_plot is not None and pfi9_rate_hz_buffer:
@@ -3537,6 +6012,9 @@ def run_live_plot(
                     if plot_update_counter % autoscale_every_n_plot_updates == 0:
                         ax.relim(visible_only=True)
                         ax.autoscale_view(scalex=False, scaley=True)
+                        if derived_axis is not None and derived_axis is not ax:
+                            derived_axis.relim(visible_only=True)
+                            derived_axis.autoscale_view(scalex=False, scaley=True)
                         if ax_demod is not None:
                             ax_demod.relim(visible_only=True)
                             ax_demod.autoscale_view(scalex=False, scaley=True)
@@ -3564,14 +6042,13 @@ def run_live_plot(
                         if reader_exc is not None:
                             raise reader_exc
                         if packet is None:
-                            if (
-                                pfi9_monitor is not None
-                                and getattr(pfi9_monitor, "available", False)
-                            ):
-                                pfi9_rate_idle, _ = pfi9_monitor.read_rate()
-                                if np.isfinite(pfi9_rate_idle):
-                                    pfi9_rate_hz_buffer.append(float(pfi9_rate_idle))
-                            plt.pause(0.001)
+                            plot_rate_idle, _ = _read_plot_rate()
+                            if np.isfinite(plot_rate_idle):
+                                pfi9_rate_hz_buffer.append(float(plot_rate_idle))
+                            _maybe_show_no_data_warning(
+                                "Waiting for the next acquired line."
+                            )
+                            plt.pause(ui_idle_pause_s)
                             continue
 
                         data = packet["data"]
@@ -3580,16 +6057,29 @@ def run_live_plot(
                     else:
                         acq_start = time.perf_counter()
                         if session is None:
-                            data = pda.acquire_line(
-                                timeout=acquisition_timeout_s,
-                                read_reference=read_reference,
+                            data = _attach_phase_state(
+                                pda.acquire_line(
+                                    timeout=gui_poll_timeout_s,
+                                    read_reference=read_reference,
+                                )
                             )
                             lines_consumed = 1
                         else:
-                            data = session.read_line(timeout=acquisition_timeout_s)
+                            data = _attach_phase_state(
+                                session.read_line(timeout=gui_poll_timeout_s)
+                            )
                             lines_consumed = int(getattr(session, "last_lines_consumed", 1))
                         acq_elapsed_s = max(1e-9, time.perf_counter() - acq_start)
                 except Exception as exc:
+                    if _is_daq_timeout_error(exc):
+                        plot_rate_idle, _ = _read_plot_rate()
+                        if np.isfinite(plot_rate_idle):
+                            pfi9_rate_hz_buffer.append(float(plot_rate_idle))
+                        _maybe_show_no_data_warning(
+                            "Timed out waiting for a new line."
+                        )
+                        plt.pause(ui_idle_pause_s)
+                        continue
                     if session is not None and _is_buffer_overwrite_error(exc):
                         median_pending = (
                             float(np.median(pending_lines_buffer))
@@ -3628,17 +6118,14 @@ def run_live_plot(
                         session = None
                         line_mode = "per-line task build/start (fallback)"
                         print(f"Acquisition mode: {line_mode}")
-                        mode_badge_label = "SAFE-FALLBACK"
-                        mode_badge_color = "#f7d9d9"
-                        mode_text.set_text(mode_badge_label)
-                        mode_text.set_bbox(
-                            {"facecolor": mode_badge_color, "alpha": 0.85, "edgecolor": "none"}
-                        )
+                        _set_mode_badge("SAFE-FALLBACK", "#f7d9d9")
                         parity_reset_requested = True
                         parity_reset_reason = "fast-session fallback/possible line loss"
+                        _schedule_fast_rebuild()
                         continue
                     raise
                 lines_consumed = max(1, lines_consumed)
+                _mark_data_activity()
                 if session is not None and lines_consumed > 1:
                     latest_multiline_read_events += 1
                     latest_skipped_lines_total += (lines_consumed - 1)
@@ -3649,6 +6136,9 @@ def run_live_plot(
                             "by skipped-line parity."
                         )
                         latest_skip_warned = True
+                external_phase_state = None
+                if isinstance(data, dict):
+                    external_phase_state = data.get("_phase_state")
                 if read_reference:
                     if not (isinstance(data, dict) and "main" in data and "reference" in data):
                         raise RuntimeError(
@@ -3657,8 +6147,16 @@ def run_live_plot(
                     line = np.asarray(data["main"], dtype=float)
                     ref_line = np.asarray(data["reference"], dtype=float)
                 else:
-                    line = np.asarray(data, dtype=float)
-                    ref_line = None
+                    if isinstance(data, dict) and "main" in data:
+                        line = np.asarray(data["main"], dtype=float)
+                        ref_line = (
+                            None
+                            if data.get("reference") is None
+                            else np.asarray(data["reference"], dtype=float)
+                        )
+                    else:
+                        line = np.asarray(data, dtype=float)
+                        ref_line = None
                 if acq_elapsed_s > 0:
                     line_rate_hz_buffer.append(lines_consumed / acq_elapsed_s)
                 read_service_rate_hz = (
@@ -3675,10 +6173,14 @@ def run_live_plot(
                 pfi9_rate_hz = float("nan")
                 pfi9_count = None
                 edge_delta_since_last_line = None
-                if pfi9_monitor is not None and getattr(pfi9_monitor, "available", False):
-                    pfi9_rate_hz, pfi9_count = pfi9_monitor.read_rate()
-                    if np.isfinite(pfi9_rate_hz):
-                        pfi9_rate_hz_buffer.append(pfi9_rate_hz)
+                pfi9_rate_hz, _ = _read_plot_rate()
+                if np.isfinite(pfi9_rate_hz):
+                    pfi9_rate_hz_buffer.append(pfi9_rate_hz)
+                if (
+                    pfi9_monitor is not None
+                    and getattr(pfi9_monitor, "available", False)
+                ):
+                    _, pfi9_count = pfi9_monitor.read_rate()
                     if pfi9_count is not None:
                         if pfi9_count_prev is not None:
                             edge_delta_since_last_line = max(
@@ -3695,6 +6197,13 @@ def run_live_plot(
                         trigger_eff = 1.0
                 else:
                     trigger_eff = 1.0
+
+                if (
+                    rate_plot_enable
+                    and not (rate_plot_is_pfi9 or rate_plot_is_chopper_input)
+                    and np.isfinite(wall_line_rate_hz)
+                ):
+                    pfi9_rate_hz_buffer.append(float(wall_line_rate_hz))
 
                 if reader is None:
                     reader_queue_depth = float("nan")
@@ -3716,7 +6225,7 @@ def run_live_plot(
                 line_counter += lines_consumed
                 size_changed = False
                 if line.size != x.size:
-                    x = np.arange(line.size)
+                    x = pda.output_sample_axis(line.size)
                     raw_line_plot.set_xdata(x)
                     integrated_line_plot.set_xdata(x)
                     if ref_raw_line_plot is not None:
@@ -3727,30 +6236,48 @@ def run_live_plot(
                         diff_raw_line_plot.set_xdata(x)
                     if diff_integrated_line_plot is not None:
                         diff_integrated_line_plot.set_xdata(x)
+                    if derived_axis is not None and derived_axis is not ax:
+                        derived_axis.set_xlim(float(x[0]), float(x[-1]))
                     if chop_raw_line_plot is not None:
                         chop_raw_line_plot.set_xdata(x)
                     if chop_integrated_line_plot is not None:
                         chop_integrated_line_plot.set_xdata(x)
-                    ax.set_xlim(0, max(1, line.size - 1))
+                    if chop_integrated_pairwise_dark_corrected_plot is not None:
+                        chop_integrated_pairwise_dark_corrected_plot.set_xdata(x)
+                    if chop_main_diag_line_plot is not None:
+                        chop_main_diag_line_plot.set_xdata(x)
+                    if chop_ref_diag_line_plot is not None:
+                        chop_ref_diag_line_plot.set_xdata(x)
+                    ax.set_xlim(float(x[0]), float(x[-1]))
                     if ax_demod is not None:
-                        ax_demod.set_xlim(0, max(1, line.size - 1))
+                        ax_demod.set_xlim(float(x[0]), float(x[-1]))
                     line_buffer.clear()
                     integration_sum = np.zeros_like(x, dtype=float)
                     ref_line_buffer.clear()
                     ref_integration_sum = np.zeros_like(x, dtype=float)
+                    diff_line_buffer.clear()
+                    diff_integration_sum = np.zeros_like(x, dtype=float)
                     chop_prev_line = None
                     chop_phase = 0
                     chop_phase0_buffer.clear()
                     chop_phase1_buffer.clear()
                     chop_phase0_sum = np.zeros_like(x, dtype=float)
                     chop_phase1_sum = np.zeros_like(x, dtype=float)
+                    chop_ref_phase0_buffer.clear()
+                    chop_ref_phase1_buffer.clear()
+                    chop_ref_phase0_sum = np.zeros_like(x, dtype=float)
+                    chop_ref_phase1_sum = np.zeros_like(x, dtype=float)
                     chop_pair_buffer.clear()
                     chop_pair_sum = np.zeros_like(x, dtype=float)
+                    _reset_pairwise_dark_corrected_local()
                     chop_pair_counter = 0
                     chop_preview_flip_counter = 0
                     chop_parity_reset_counter = 0
                     latest_chop_pair = None
                     latest_chop_integrated = None
+                    latest_chop_integrated_pairwise_dark_corrected = None
+                    latest_chop_main_diagnostic = None
+                    latest_chop_ref_diagnostic = None
                     chop_preview_template = None
                     chop_prev_phase = None
                     demod_last_line_phase = None
@@ -3773,6 +6300,22 @@ def run_live_plot(
                         print(
                             "Cleared pump-dark offset after sample-count change."
                         )
+                    if (
+                        channel_dark_main_offset is not None
+                        and channel_dark_main_offset.size != line.size
+                    ) or (
+                        channel_dark_ref_offset is not None
+                        and channel_dark_ref_offset.size != line.size
+                    ):
+                        channel_dark_main_offset = None
+                        channel_dark_ref_offset = None
+                        _set_channel_dark_status(
+                            f"size mismatch after resize ({line.size})"
+                        )
+                        _sync_channel_dark_to_runtime()
+                        print(
+                            "Cleared channel-dark offsets after sample-count change."
+                        )
                     parity_reset_requested = True
                     parity_reset_reason = "line size changed"
                     size_changed = True
@@ -3794,8 +6337,34 @@ def run_live_plot(
                     ref_integrated_line = None
 
                 if ref_line is not None:
-                    diff_line = line - ref_line
-                    diff_integrated_line = integrated_line - ref_integrated_line
+                    if reference_processing_mode == "ratio":
+                        corrected_main = _apply_channel_dark_local(
+                            line,
+                            channel_dark_main_offset,
+                        )
+                        corrected_ref = _apply_channel_dark_local(
+                            ref_line,
+                            channel_dark_ref_offset,
+                        )
+                        corrected_integrated_main = _apply_channel_dark_local(
+                            integrated_line,
+                            channel_dark_main_offset,
+                        )
+                        corrected_integrated_ref = _apply_channel_dark_local(
+                            ref_integrated_line,
+                            channel_dark_ref_offset,
+                        )
+                        diff_line = _reference_ratio_local(
+                            corrected_main,
+                            corrected_ref,
+                        )
+                        diff_integrated_line = _reference_ratio_local(
+                            corrected_integrated_main,
+                            corrected_integrated_ref,
+                        )
+                    else:
+                        diff_line = line - ref_line
+                        diff_integrated_line = integrated_line - ref_integrated_line
                 else:
                     diff_line = None
                     diff_integrated_line = None
@@ -3827,6 +6396,8 @@ def run_live_plot(
                             if capture_hit_flags
                             else float("nan")
                         )
+
+                demod_line = _demod_source_line_local(line, diff_line)
 
                 if pump_chop_demod:
                     parity_reset_needed = False
@@ -3923,10 +6494,18 @@ def run_live_plot(
                         chop_phase1_buffer.clear()
                         chop_phase0_sum = np.zeros_like(x, dtype=float)
                         chop_phase1_sum = np.zeros_like(x, dtype=float)
+                        chop_ref_phase0_buffer.clear()
+                        chop_ref_phase1_buffer.clear()
+                        chop_ref_phase0_sum = np.zeros_like(x, dtype=float)
+                        chop_ref_phase1_sum = np.zeros_like(x, dtype=float)
                         chop_pair_buffer.clear()
                         chop_pair_sum = np.zeros_like(x, dtype=float)
+                        _reset_pairwise_dark_corrected_local()
                         latest_chop_pair = None
                         latest_chop_integrated = None
+                        latest_chop_integrated_pairwise_dark_corrected = None
+                        latest_chop_main_diagnostic = None
+                        latest_chop_ref_diagnostic = None
                         chop_preview_template = None
                         chop_parity_reset_counter += 1
                         if not chop_parity_warned:
@@ -3943,14 +6522,23 @@ def run_live_plot(
                     elif pump_chop_use_adjacent_pairs:
                         if pump_chop_sign_agnostic_preview:
                             if chop_prev_line is None:
-                                chop_prev_line = line.copy()
+                                chop_prev_line = demod_line.copy()
                                 latest_chop_pair = None
                                 latest_chop_integrated = None
                             else:
-                                chop_pair = pump_chop_sign * (line - chop_prev_line)
+                                if reference_processing_mode == "ratio" and ref_line is not None:
+                                    chop_pair = _tail_guided_reference_delta_od(
+                                        demod_line,
+                                        chop_prev_line,
+                                    )
+                                else:
+                                    chop_pair = _tail_guided_pair(
+                                        demod_line - chop_prev_line
+                                    )
                                 if (
                                     chop_preview_template is not None
                                     and np.any(np.isfinite(chop_preview_template))
+                                    and not pump_chop_tail_heuristic_enable
                                 ):
                                     template_dot = float(
                                         np.dot(chop_pair, chop_preview_template)
@@ -3960,6 +6548,7 @@ def run_live_plot(
                                         chop_preview_flip_counter += 1
                                 chop_pair_counter += 1
                                 latest_chop_pair = chop_pair
+                                _update_pairwise_dark_corrected_referenced_local(chop_pair)
                                 if len(chop_pair_buffer) == chop_pair_buffer.maxlen:
                                     chop_pair_sum -= chop_pair_buffer.popleft()
                                 chop_pair_buffer.append(chop_pair.copy())
@@ -3968,19 +6557,26 @@ def run_live_plot(
                                     len(chop_pair_buffer)
                                 )
                                 chop_preview_template = latest_chop_integrated.copy()
-                                chop_prev_line = line.copy()
+                                chop_prev_line = demod_line.copy()
                         else:
-                            if demod_qual_active:
-                                current_phase = int(
-                                    0 if demod_line_phase is None else demod_line_phase
-                                )
+                            if actual_phase_source == "chopper_input":
+                                if external_phase_state is None:
+                                    latest_chop_pair = None
+                                    latest_chop_integrated = None
+                                    continue
+                                current_phase = int(bool(external_phase_state))
                             else:
-                                current_phase = int(
-                                    chop_phase ^ ((lines_consumed - 1) & 1)
-                                )
-                                chop_phase = int(chop_phase ^ (lines_consumed & 1))
+                                if demod_qual_active:
+                                    current_phase = int(
+                                        0 if demod_line_phase is None else demod_line_phase
+                                    )
+                                else:
+                                    current_phase = int(
+                                        chop_phase ^ ((lines_consumed - 1) & 1)
+                                    )
+                                    chop_phase = int(chop_phase ^ (lines_consumed & 1))
                             if chop_prev_line is None:
-                                chop_prev_line = line.copy()
+                                chop_prev_line = demod_line.copy()
                                 chop_prev_phase = current_phase
                                 latest_chop_pair = None
                                 latest_chop_integrated = None
@@ -3990,9 +6586,37 @@ def run_live_plot(
                                     or (current_phase != chop_prev_phase)
                                 )
                                 if make_pair:
-                                    chop_pair = pump_chop_sign * (line - chop_prev_line)
+                                    if (
+                                        reference_processing_mode == "ratio"
+                                        and ref_line is not None
+                                        and actual_phase_source != "chopper_input"
+                                    ):
+                                        chop_pair = _tail_guided_reference_delta_od(
+                                            demod_line,
+                                            chop_prev_line,
+                                        )
+                                    elif (
+                                        reference_processing_mode == "ratio"
+                                        and ref_line is not None
+                                    ):
+                                        pumped_phase = 1 if pump_chop_sign > 0 else 0
+                                        if current_phase == pumped_phase:
+                                            pumped_ratio = demod_line
+                                            unpumped_ratio = chop_prev_line
+                                        else:
+                                            pumped_ratio = chop_prev_line
+                                            unpumped_ratio = demod_line
+                                        chop_pair = _compute_delta_od_local(
+                                            pumped_ratio,
+                                            unpumped_ratio,
+                                        )
+                                    else:
+                                        chop_pair = _tail_guided_pair(
+                                            demod_line - chop_prev_line
+                                        )
                                     chop_pair_counter += 1
                                     latest_chop_pair = chop_pair
+                                    _update_pairwise_dark_corrected_referenced_local(chop_pair)
                                     if len(chop_pair_buffer) == chop_pair_buffer.maxlen:
                                         chop_pair_sum -= chop_pair_buffer.popleft()
                                     chop_pair_buffer.append(chop_pair.copy())
@@ -4002,10 +6626,16 @@ def run_live_plot(
                                     )
                                 else:
                                     latest_chop_pair = None
-                                chop_prev_line = line.copy()
+                                chop_prev_line = demod_line.copy()
                                 chop_prev_phase = current_phase
                     else:
-                        if demod_qual_active:
+                        if actual_phase_source == "chopper_input":
+                            if external_phase_state is None:
+                                latest_chop_pair = None
+                                latest_chop_integrated = None
+                                continue
+                            current_phase = int(bool(external_phase_state))
+                        elif demod_qual_active:
                             current_phase = int(
                                 0 if demod_line_phase is None else demod_line_phase
                             )
@@ -4020,14 +6650,24 @@ def run_live_plot(
                                 chop_phase0_sum -= chop_phase0_buffer.popleft()
                             chop_phase0_buffer.append(line.copy())
                             chop_phase0_sum += line
+                            if reference_processing_mode == "ratio" and ref_line is not None:
+                                if len(chop_ref_phase0_buffer) == chop_ref_phase0_buffer.maxlen:
+                                    chop_ref_phase0_sum -= chop_ref_phase0_buffer.popleft()
+                                chop_ref_phase0_buffer.append(ref_line.copy())
+                                chop_ref_phase0_sum += ref_line
                         else:
                             if len(chop_phase1_buffer) == chop_phase1_buffer.maxlen:
                                 chop_phase1_sum -= chop_phase1_buffer.popleft()
                             chop_phase1_buffer.append(line.copy())
                             chop_phase1_sum += line
+                            if reference_processing_mode == "ratio" and ref_line is not None:
+                                if len(chop_ref_phase1_buffer) == chop_ref_phase1_buffer.maxlen:
+                                    chop_ref_phase1_sum -= chop_ref_phase1_buffer.popleft()
+                                chop_ref_phase1_buffer.append(ref_line.copy())
+                                chop_ref_phase1_sum += ref_line
 
                         if chop_prev_line is None:
-                            chop_prev_line = line.copy()
+                            chop_prev_line = demod_line.copy()
                             chop_prev_phase = current_phase
                             latest_chop_pair = None
                         else:
@@ -4036,15 +6676,55 @@ def run_live_plot(
                                 or (current_phase != chop_prev_phase)
                             )
                             if make_pair:
-                                chop_pair = pump_chop_sign * (line - chop_prev_line)
+                                if (
+                                    reference_processing_mode == "ratio"
+                                    and ref_line is not None
+                                    and pump_chop_tail_heuristic_enable
+                                    and actual_phase_source != "chopper_input"
+                                ):
+                                    chop_pair = _tail_guided_reference_delta_od(
+                                        demod_line,
+                                        chop_prev_line,
+                                    )
+                                elif reference_processing_mode == "ratio" and ref_line is not None:
+                                    pumped_phase = 1 if pump_chop_sign > 0 else 0
+                                    if current_phase == pumped_phase:
+                                        pumped_ratio = demod_line
+                                        unpumped_ratio = chop_prev_line
+                                    else:
+                                        pumped_ratio = chop_prev_line
+                                        unpumped_ratio = demod_line
+                                    chop_pair = _compute_delta_od_local(
+                                        pumped_ratio,
+                                        unpumped_ratio,
+                                    )
+                                else:
+                                    chop_pair = _tail_guided_pair(demod_line - chop_prev_line)
                                 chop_pair_counter += 1
                                 latest_chop_pair = chop_pair
+                                _update_pairwise_dark_corrected_referenced_local(chop_pair)
+                                if pump_chop_tail_heuristic_enable:
+                                    if len(chop_pair_buffer) == chop_pair_buffer.maxlen:
+                                        chop_pair_sum -= chop_pair_buffer.popleft()
+                                    chop_pair_buffer.append(chop_pair.copy())
+                                    chop_pair_sum += chop_pair
                             else:
                                 latest_chop_pair = None
-                            chop_prev_line = line.copy()
+                            chop_prev_line = demod_line.copy()
                             chop_prev_phase = current_phase
 
-                        if len(chop_phase0_buffer) > 0 and len(chop_phase1_buffer) > 0:
+                        referenced_phase_delta_od = _referenced_phase_diagnostics_local()
+
+                        if pump_chop_tail_heuristic_enable and actual_phase_source != "chopper_input":
+                            if len(chop_pair_buffer) > 0:
+                                latest_chop_integrated = chop_pair_sum / float(
+                                    len(chop_pair_buffer)
+                                )
+                            else:
+                                latest_chop_integrated = None
+                        elif referenced_phase_delta_od is not None:
+                            latest_chop_integrated = referenced_phase_delta_od
+                        elif len(chop_phase0_buffer) > 0 and len(chop_phase1_buffer) > 0:
                             phase0_mean = chop_phase0_sum / float(len(chop_phase0_buffer))
                             phase1_mean = chop_phase1_sum / float(len(chop_phase1_buffer))
                             latest_chop_integrated = pump_chop_sign * (
@@ -4081,10 +6761,21 @@ def run_live_plot(
                     and diff_integrated_line is not None
                 ):
                     diff_integrated_line_plot.set_ydata(diff_integrated_line)
-                if chop_raw_line_plot is not None and latest_chop_pair is not None:
-                    chop_raw_line_plot.set_ydata(latest_chop_pair)
-                latest_chop_integrated_display = _apply_pump_dark_offset(
-                    latest_chop_integrated
+                latest_chop_pair_display = _prepare_chop_display(
+                    latest_chop_pair,
+                    integrated_line,
+                    apply_dark=False,
+                )
+                if (
+                    chop_raw_line_plot is not None
+                    and latest_chop_pair_display is not None
+                ):
+                    chop_raw_line_plot.set_ydata(latest_chop_pair_display)
+                latest_chop_integrated_display = _prepare_chop_display(
+                    latest_chop_integrated,
+                    integrated_line,
+                    apply_dark=True,
+                    dark_role="demod",
                 )
                 if (
                     chop_integrated_line_plot is not None
@@ -4093,16 +6784,59 @@ def run_live_plot(
                     chop_integrated_line_plot.set_ydata(
                         latest_chop_integrated_display
                     )
+                latest_chop_integrated_pairwise_dark_corrected_display = _prepare_chop_display(
+                    latest_chop_integrated_pairwise_dark_corrected,
+                    integrated_line,
+                    apply_dark=False,
+                )
+                if (
+                    chop_integrated_pairwise_dark_corrected_plot is not None
+                    and latest_chop_integrated_pairwise_dark_corrected_display is not None
+                ):
+                    chop_integrated_pairwise_dark_corrected_plot.set_ydata(
+                        latest_chop_integrated_pairwise_dark_corrected_display
+                    )
+                latest_chop_main_diag_display = _prepare_chop_display(
+                    latest_chop_main_diagnostic,
+                    integrated_line,
+                    apply_dark=True,
+                    dark_role="main_diagnostic",
+                )
+                latest_chop_ref_diag_display = _prepare_chop_display(
+                    latest_chop_ref_diagnostic,
+                    ref_integrated_line,
+                    apply_dark=True,
+                    dark_role="ref_diagnostic",
+                )
+                if (
+                    chop_main_diag_line_plot is not None
+                    and latest_chop_main_diag_display is not None
+                ):
+                    chop_main_diag_line_plot.set_ydata(
+                        latest_chop_main_diag_display
+                    )
+                if (
+                    chop_ref_diag_line_plot is not None
+                    and latest_chop_ref_diag_display is not None
+                ):
+                    chop_ref_diag_line_plot.set_ydata(
+                        latest_chop_ref_diag_display
+                    )
 
                 ax.set_title(
                     "CMOS Video (Simple Mode) "
-                    f"| mode={mode_key} "
-                    f"| st_delay={pda.st_initial_delay * 1e6:.1f} us "
-                    f"| clk_delay={pda.clk_initial_delay * 1e6:.1f} us "
-                    f"| integrated N={len(line_buffer)} "
-                    f"| svc={read_service_rate_hz:.1f} Hz "
-                    f"| wall={wall_line_rate_hz:.1f} Hz "
-                    f"| eff={100.0 * trigger_eff:.1f}%"
+                    + f"| mode={mode_key} "
+                    + (
+                        f"| derived={derived_signal_label} "
+                        if read_reference
+                        else ""
+                    )
+                    + f"| st_delay={pda.st_initial_delay * 1e6:.1f} us "
+                    + f"| clk_delay={pda.clk_initial_delay * 1e6:.1f} us "
+                    + f"| integrated N={len(line_buffer)} "
+                    + f"| svc={read_service_rate_hz:.1f} Hz "
+                    + f"| wall={wall_line_rate_hz:.1f} Hz "
+                    + f"| eff={100.0 * trigger_eff:.1f}%"
                     + (
                         f" | q~{pending_lines:.1f} lines"
                         if session is not None and np.isfinite(pending_lines)
@@ -4114,13 +6848,23 @@ def run_live_plot(
                         else ""
                     )
                     + (
-                        f" | pfi9~{pfi9_rate_hz:.1f} Hz"
+                        f" | {rate_title_prefix}~{pfi9_rate_hz:.1f} Hz"
                         if np.isfinite(pfi9_rate_hz)
                         else ""
                     )
                     + (
                         f" | chop_pairs={chop_pair_counter}"
                         if pump_chop_demod
+                        else ""
+                    )
+                    + (
+                        f" | phase={pda.chopper_input_term.split('/')[-1]}"
+                        if (pump_chop_demod and actual_phase_source == "chopper_input")
+                        else ""
+                    )
+                    + (
+                        f" | tailflips={tail_guided_flip_counter} tail={tail_guided_last_mean:+.3g}"
+                        if (pump_chop_demod and pump_chop_tail_heuristic_enable)
                         else ""
                     )
                     + (
@@ -4137,21 +6881,7 @@ def run_live_plot(
                     d = pda.get_timing_diagnostics(
                         trigger_frequency_hz=expected_trigger_hz
                     )
-                    if pfi9_monitor is None:
-                        pfi9_status_line = "PFI9 monitor: disabled"
-                    elif getattr(pfi9_monitor, "available", False):
-                        pfi9_status_line = (
-                            "PFI9 monitor: active "
-                            f"({pfi9_monitor.counter}, gate={pfi9_monitor.rate_gate_s * 1e3:.1f} ms)"
-                        )
-                    else:
-                        pfi9_err = str(getattr(pfi9_monitor, "error_text", "")).strip()
-                        if len(pfi9_err) > 90:
-                            pfi9_err = pfi9_err[:87] + "..."
-                        pfi9_status_line = (
-                            "PFI9 monitor: unavailable"
-                            + (f" ({pfi9_err})" if pfi9_err else "")
-                        )
+                    pfi9_status_line = _rate_status_line()
                     pfi9_med = (
                         float(np.median(pfi9_rate_hz_buffer))
                         if pfi9_rate_hz_buffer
@@ -4173,10 +6903,11 @@ def run_live_plot(
                         f"AUC main={integrated_auc_main:.6g} V*s",
                     ]
                     if np.isfinite(integrated_auc_ref):
-                        timing_lines.append(
-                            f"AUC ref/diff={integrated_auc_ref:.6g}/"
-                            f"{integrated_auc_diff:.6g} V*s"
-                        )
+                            timing_lines.append(
+                                f"AUC ref/{derived_signal_label}="
+                                f"{integrated_auc_ref:.6g}/"
+                                f"{integrated_auc_diff:.6g} {derived_signal_units}*s"
+                            )
                     timing_lines.append(
                         (
                             f"ST rise/fall={d['st_rise_s'] * 1e6:.1f}/"
@@ -4197,8 +6928,8 @@ def run_live_plot(
                         )
                     )
                     if np.isfinite(pfi9_med):
-                        pfi9_line = f"PFI9 med={pfi9_med:.1f} Hz"
-                        if expected_trigger_hz > 0:
+                        pfi9_line = f"{rate_med_label}={pfi9_med:.1f} Hz"
+                        if rate_plot_is_pfi9 and expected_trigger_hz > 0:
                             pfi9_line += (
                                 f" ({pfi9_med / expected_trigger_hz:.2f}x)"
                             )
@@ -4236,7 +6967,13 @@ def run_live_plot(
                                 f"{capture_hit_warmup_lines}"
                             )
                     if pump_chop_demod:
-                        chop_line = f"Chop {demod_mode_label}"
+                        chop_line = (
+                            f"Chop {demod_mode_label} sign={pump_chop_sign:+.0f}"
+                        )
+                        if actual_phase_source == "chopper_input":
+                            chop_line += (
+                                f" phase={pda.chopper_input_term.split('/')[-1]}"
+                            )
                         if pump_chop_use_adjacent_pairs:
                             chop_line += f" pairs={len(chop_pair_buffer)}"
                             if pump_chop_sign_agnostic_preview:
@@ -4249,12 +6986,20 @@ def run_live_plot(
                         chop_line += f" resets={chop_parity_reset_counter}"
                         timing_lines.append(chop_line)
                         timing_lines.append(f"Dark={pump_chop_dark_status}")
-                        if latest_chop_integrated_display is not None:
-                            chop_rms = float(np.std(latest_chop_integrated_display))
-                            chop_pp = float(np.ptp(latest_chop_integrated_display))
+                        if channel_dark_subtract:
                             timing_lines.append(
-                                f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} V"
+                                f"{channel_dark_label}={channel_dark_status}"
                             )
+                        if latest_chop_integrated_display is not None:
+                            chop_rms, chop_pp = _trace_rms_pp(
+                                latest_chop_integrated_display
+                            )
+                            timing_lines.append(
+                                f"Chop RMS/PP={chop_rms:.4g}/{chop_pp:.4g} {chop_signal_units}"
+                            )
+                        timing_lines.append(
+                            "Keys: d save diff-dark | l load | x clear | c save intensity/chan-dark | v load | n clear | s flip | +/- sign | q/esc stop"
+                        )
                     timing_text.set_text("\n".join(timing_lines))
 
                 if ax_trig is not None and trig_rate_plot is not None and pfi9_rate_hz_buffer:
@@ -4266,6 +7011,9 @@ def run_live_plot(
                 if plot_update_counter % autoscale_every_n_plot_updates == 0:
                     ax.relim(visible_only=True)
                     ax.autoscale_view(scalex=False, scaley=True)
+                    if derived_axis is not None and derived_axis is not ax:
+                        derived_axis.relim(visible_only=True)
+                        derived_axis.autoscale_view(scalex=False, scaley=True)
                     if ax_demod is not None:
                         ax_demod.relim(visible_only=True)
                         ax_demod.autoscale_view(scalex=False, scaley=True)
@@ -4273,9 +7021,11 @@ def run_live_plot(
                         ax_trig.relim(visible_only=True)
                         ax_trig.autoscale_view(scalex=False, scaley=True)
                 fig.canvas.draw_idle()
-                plt.pause(0.001)
+                plt.pause(ui_idle_pause_s)
 
     except KeyboardInterrupt:
+        stop_requested = True
+        stop_reason = "keyboard interrupt"
         print("\nStopped continuous acquisition.")
     finally:
         if processor is not None:
@@ -4288,9 +7038,17 @@ def run_live_plot(
                 reader.close()
             except Exception:
                 pass
+        if 'session' in locals() and session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
         pda.video_main = original_video_main
         plt.ioff()
-        plt.show()
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
 
 
 def _build_cli_parser():
@@ -4453,7 +7211,7 @@ def _resolve_runtime_profile_settings(profile_name):
             "plot_target_fps": 10.0,
             "timing_text_update_every_n_lines": 200,
             "autoscale_every_n_plot_updates": 12,
-            "persistent_ai_buffer_lines": 256,
+            "persistent_ai_buffer_lines": 2048,
         }
     if profile == RUNTIME_PROFILE_PERSISTENT_ROBUST:
         return {
@@ -4467,7 +7225,7 @@ def _resolve_runtime_profile_settings(profile_name):
             "plot_target_fps": 25.0,
             "timing_text_update_every_n_lines": 40,
             "autoscale_every_n_plot_updates": 8,
-            "persistent_ai_buffer_lines": 256,
+            "persistent_ai_buffer_lines": 2048,
         }
     if profile == RUNTIME_PROFILE_SAFE:
         return {
@@ -4595,6 +7353,7 @@ def main():
         "capture_hit_rate_window_lines": 256,
         "capture_hit_threshold_fraction": 0.45,
         "capture_hit_warmup_lines": 64,
+        "ordered_read_batch_lines": 16,
         "tdms_log_enable": False,
         "tdms_group_name": "PDA",
         "tdms_logging_mode": LoggingMode.LOG_AND_READ,
